@@ -1,0 +1,151 @@
+/* Resetting default css values*/
+html,body,div,span,applet,object,iframe,h1,h2,h3,h4,h5,h6,p,blockquote,pre,a,abbr,acronym,address,big,cite,code,del,dfn,em,img,ins,kbd,q,s,samp,small,strike,strong,sub,sup,tt,var,b,u,i,center,dl,dt,dd,ol,ul,li,fieldset,form,label,legend,table,caption,tbody,tfoot,thead,tr,th,td,article,aside,canvas,details,embed,figure,figcaption,footer,header,hgroup,menu,nav,output,ruby,section,summary,time,mark,audio,video {
+    margin:0;
+    padding:0;
+    border:0;
+    font-size:100%;
+    font:inherit;
+    vertical-align:baseline;
+    box-sizing:border-box
+   }
+article,
+aside,
+details,
+figcaption,
+figure,
+footer,
+header,
+hgroup,
+menu,
+nav,
+section {
+    display:block
+}
+
+/* Actual CSS */
+body {
+    font-family: "palatino", "Georgia", "Times New Roman", serif;
+}
+
+header {
+    margin-bottom: 2rem;
+}
+
+
+.container {
+    display: flex;
+    flex-wrap: wrap;
+    /* border: 1px solid blue; */
+    justify-content: center;
+    margin: 2% 15% 2% 15%;
+    line-height: 1.6rem;
+}
+
+.sidebar_container {
+    /* border: 1px solid red; */
+    padding: 2%;
+    flex: 1;
+}
+
+.sidebar_container li {
+    list-style-type: none;
+}
+
+a {
+    color: rgb(139, 48, 32);
+}
+
+a:hover {
+    font-weight: bold;
+}
+
+.main_container {
+    /* border: 1px solid black; */
+    padding: 2% 5% 2% 5%;
+    flex: 3;
+}
+
+.main_container p {
+    text-indent: 2rem;
+}
+
+.blog_excerpt {
+    list-style-type: None;
+}
+
+.blog_excerpt:not(:first-child) {
+    margin-top: 2rem;
+}
+
+.main_container section:not(:first-child) {
+    margin-top: 2rem;
+}
+
+.current {
+    font-weight: bold;
+}
+
+.main_container h2 {
+    font-size: x-large;
+    font-weight: bold;
+    margin-bottom: 1rem;
+}
+
+.main_container h2:not(:first-child) {
+    margin-top: 1rem;
+}
+
+.news > ul > li {
+    list-style-position: inside;
+}
+.cv > ul > li {
+    list-style-type: None;
+}
+
+.cv > ul > li {
+    margin-top: 1rem;
+}
+
+.cv > ul > li > p {
+    text-indent: 1rem;
+}
+
+.cv > ul > li > ul > li {
+    text-indent: 1rem;
+    list-style-position: inside;
+}
+
+.cv > ul > li > ul > li > ul > li {
+    text-indent: 2rem;
+}
+
+.page > * {
+    padding: 1rem;
+}
+
+footer {
+    margin-top: 2rem;
+    text-align: center;
+}
+
+h1 {
+    font-size: x-large;
+    font-weight: bold;
+    margin-bottom: 2rem;
+}
+
+h3 {
+    margin-bottom: 1rem;
+}
+
+i {
+    font-style: italic;
+}
+
+em {
+    background: rgb(219, 222, 255);
+}
+
+strong {
+    font-weight: bold;
+}
