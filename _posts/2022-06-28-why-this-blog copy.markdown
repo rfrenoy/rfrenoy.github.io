@@ -1,7 +1,7 @@
 ---
 layout: post
 title:  Why this blog?
-date:   2022-01-12
+date:   2022-06-28
 categories: introduction
 excerpt_separator: <!-- excerpt-end -->
 ---
