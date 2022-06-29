@@ -29,4 +29,5 @@ Let's take the example of sports analytics, and let's say that we would like to 
 </p>
 
 
-Tracking by detection
+Tracking by detection, face recognition (reducing search space)
+VOT, pytracking

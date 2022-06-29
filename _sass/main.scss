@@ -101,8 +101,8 @@ a:hover {
     margin-top: 1rem;
 }
 
-.post p:not(:last-child) {
-    margin-bottom: 1rem;
+.post p:not(:first-child) {
+    margin-top: 1rem;
 }
 
 .news > ul > li {
