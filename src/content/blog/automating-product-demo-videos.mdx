@@ -1,0 +1,159 @@
+---
+title: "Automating Product Demo Videos with AI and Remotion"
+date: "2026-03-13"
+description: "Building a CLI that turns product screenshots into polished 20-second demo videos, using Claude's vision capabilities and Remotion's React-based video engine."
+---
+
+*[Source code on GitHub](https://github.com/rfrenoy/auto-product-demo)*
+
+Every SaaS product needs a demo video. For landing pages, for social media, for investor decks.  
+
+And yet, making even a simple 20-second product walkthrough is a lot of effort: screen recording, editing, motion graphics, export. It's either expensive (hire someone) or time-consuming (learn After Effects). It is worthwhile when your product is mature, but for an early-stage product, spending that much time on a marketing video you may throw away in a few weeks makes little sense. Yet you would still like to have something to show people what you are building. That's where this project comes in.
+
+## The idea
+
+Agents are increasingly good at coding, and Remotion creates videos from React code. So we should be able to build short, meaningful videos with the help of agents.
+
+Ideally, users take a couple of screenshots of their product, give the tool a tagline, and get back a polished demo video. No screen recording, no editing software.
+
+```bash
+auto-product-demo \
+  --product-name "Auto product demo" \
+  --screenshots screenshot1.png screenshot2.png \
+  --tagline "Build a demo video for your product in 5 minutes" \
+  --output demo.mp4
+```
+
+The trick: instead of stitching together the raw screenshots with transitions (which tends to look cheap), have an AI agent *analyze* the screenshots and generate <mark>animated UI mockups</mark>: stylized, simplified recreations of the product interface with elements that slide, fade, and appear sequentially. The result feels closer to a motion design piece than a slideshow.
+
+## How it works under the hood
+
+The system has three layers:
+
+1. <mark>A CLI</mark> that validates inputs and orchestrates everything
+2. <mark>An AI agent loop</mark> that generates React code from screenshot analysis
+3. <mark>A Remotion rendering pipeline</mark> that turns that React code into an MP4
+
+### The agent
+
+The core of the project is a conversation with Claude Sonnet 4.6. We send:
+
+- The product screenshots as images (Claude's vision capabilities analyze them)
+- The product name and tagline
+- A detailed system prompt with two roles: *video producer* (what to create) and *Remotion developer* (how to create it)
+
+The system prompt instructs Claude to look at the screenshots and extract the color palette, layout patterns, and key features, then generate a single self-contained React component (`ProductDemo.tsx`) that renders an animated 20-second video.
+
+The video follows a fixed structure:
+- <mark>Intro (0–3s)</mark>: Product name with an entrance animation
+- <mark>Feature showcase (3–15s)</mark>: Animated mockup: UI elements appear sequentially (sidebar slides in, cards fade in, buttons appear)
+- <mark>Tagline (15–20s)</mark>: Value proposition, centered, with a clean transition
+
+### The Remotion skills
+
+One challenge: Claude needs to know *how* to write Remotion code correctly. Remotion has specific patterns: you can't use CSS transitions (they don't render in the video pipeline), you must use `useCurrentFrame()` with `interpolate()` or `spring()` for all animations, images must use `<Img>` not `<img>`, and so on.
+
+The [Remotion project maintains a set of "agent skills"](https://github.com/remotion-dev/skills): markdown documents with best practices, rules, and code examples. We copied all 41 skill files into our project and concatenated them into the system prompt. That's roughly 119k characters of Remotion-specific knowledge that prevents the agent from making common mistakes.
+
+A few of the rules that matter most:
+
+```markdown
+# From animations.md
+All animations MUST be driven by the useCurrentFrame() hook.
+CSS transitions or animations are FORBIDDEN - they will not render correctly.
+
+# From sequencing.md
+Always premount any <Sequence>!
+
+# From transitions.md
+Use <TransitionSeries> with fade(), slide(), or wipe() for scene transitions.
+```
+
+### The retry loop
+
+Generated code can fail. Maybe the agent uses an API that doesn't exist, maybe there's a type error, maybe the render times out. The system handles this with a conversational retry loop:
+
+```
+Iteration 1: Generate code → Write to template → Run remotion render
+  ❌ Compilation error: "Cannot find module '@remotion/transitions/dissolve'"
+  
+Iteration 2: Send error back to Claude → Get corrected code → Render
+  ❌ Runtime error: "spring() requires fps parameter"
+  
+Iteration 3: Send error back → Get corrected code → Render
+  ✅ Success! → demo.mp4
+```
+
+Each error is appended to the conversation history, so Claude has full context on what went wrong and what it already tried. The loop runs for a maximum of 5 iterations before giving up. It is a simple but effective guardrail against runaway API costs.
+
+The key insight: because we keep the full conversation, Claude doesn't repeat the same mistakes. Each retry tends to be a targeted fix rather than a rewrite.
+
+### The rendering pipeline
+
+We maintain a pre-configured Remotion template project with all the dependencies already installed (`remotion`, `@remotion/transitions`, `@remotion/light-leaks`, `@remotion/google-fonts`). When the agent generates code, we:
+
+1. Write the `ProductDemo.tsx` file into the template's `src/` directory
+2. Run `npx remotion render ProductDemo output.mp4`
+3. If it fails, capture stderr and feed it back to the agent
+
+This is deliberately simple. The template project is a valid Remotion app at all times. The agent only needs to produce one file. The `Root.tsx` and `index.ts` are fixed scaffolding that just reference `ProductDemo`.
+
+## Architecture
+
+```
+screenshots (PNG/JPG)
+       │
+       ▼
+   CLI (commander)
+       │
+       ├── Encode to base64
+       │
+       ▼
+   Agent Loop
+       │
+       ├── System prompt (video spec + 119k chars of Remotion skills)
+       ├── User message (screenshots + product name + tagline)
+       │
+       ▼
+   Claude Sonnet 4.6 (vision)
+       │
+       ├── Generates ProductDemo.tsx
+       │
+       ▼
+   Remotion Renderer
+       │
+       ├── Write code to template project
+       ├── npx remotion render
+       │
+       ├── Success? → Return MP4
+       └── Failure? → Send error to agent, retry (max 5x)
+```
+
+The entire project is about 300 lines of TypeScript (excluding the skills documentation). The simplicity is intentional. The complexity lives in the prompt, not in the code.
+
+## Design decisions worth discussing
+
+<mark>Why animated mockups instead of using the actual screenshots?</mark>
+
+Initially I considered a simpler approach: take the screenshots and build a video around them with pan/zoom and text overlays. It would be more reliable, but it would also require more screenshots to look good, and the result would feel like a slideshow.
+
+Having the AI generate animated mockups produces a more dynamic, polished result. The trade-off is reliability: generated code can fail to compile. The retry loop mitigates this.
+
+<mark>Why a single file?</mark>
+
+Constraining the agent to output a single `ProductDemo.tsx` file reduces the surface area for errors. No import resolution issues, no missing files, no circular dependencies. The entire video is defined in one self-contained component.
+
+<mark>Why copy the Remotion skills instead of installing them at runtime?</mark>
+
+Three reasons: determinism (we control exactly what version of the skills we use), speed (no network call on every run), and customizability (we can tweak the skills as we learn what works).
+
+## What's next
+
+This is a v1. A few things I'd like to explore:
+
+- <mark>Configurable video specs</mark>: let users choose resolution, duration, and aspect ratio (vertical for social, square for Instagram, etc.)
+- <mark>Music and sound effects</mark>: Remotion supports audio. Adding a subtle background track could be a simple but nice addition.
+
+---
+
+*The project is built with TypeScript, [Remotion](https://remotion.dev), and the [Anthropic SDK](https://docs.anthropic.com). It runs entirely locally. No server, no cloud rendering.*

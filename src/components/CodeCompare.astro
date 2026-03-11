@@ -1,0 +1,51 @@
+---
+/**
+ * Side-by-side code comparison component.
+ *
+ * Usage in .mdx files:
+ *
+ *   import CodeCompare from '../../components/CodeCompare.astro';
+ *
+ *   <CodeCompare
+ *     leftTitle="nanochat (PyTorch)"
+ *     leftCode={`def norm(x):
+ *     return F.rms_norm(x, (x.size(-1),))`}
+ *     rightTitle="nanochat-mlx (MLX)"
+ *     rightCode={`def norm(x):
+ *     return mx.fast.rms_norm(x, weight=None, eps=1e-5)`}
+ *   />
+ */
+
+import { codeToHtml } from "shiki";
+
+interface Props {
+  leftTitle: string;
+  leftCode: string;
+  rightTitle: string;
+  rightCode: string;
+  lang?: string;
+}
+
+const { leftTitle, leftCode, rightTitle, rightCode, lang = "python" } =
+  Astro.props;
+
+const leftHtml = await codeToHtml(leftCode.trim(), {
+  lang,
+  theme: "github-light",
+});
+const rightHtml = await codeToHtml(rightCode.trim(), {
+  lang,
+  theme: "github-light",
+});
+---
+
+<div class="code-compare">
+  <div>
+    <div class="code-title">{leftTitle}</div>
+    <Fragment set:html={leftHtml} />
+  </div>
+  <div>
+    <div class="code-title">{rightTitle}</div>
+    <Fragment set:html={rightHtml} />
+  </div>
+</div>

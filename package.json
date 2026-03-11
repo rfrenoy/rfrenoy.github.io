@@ -1,0 +1,21 @@
+{
+  "name": "rfrenoy-blog",
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "@astrojs/mdx": "^4.3.0",
+    "astro": "^5.7.0",
+    "katex": "^0.16.22",
+    "rehype-katex": "^7.0.1",
+    "remark-math": "^6.0.0",
+    "shiki": "^3.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
+  }
+}

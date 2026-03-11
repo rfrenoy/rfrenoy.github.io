@@ -1,0 +1,33 @@
+---
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import { getCollection } from "astro:content";
+
+const posts = (await getCollection("blog")).sort(
+  (a, b) =>
+    new Date(b.data.date).getTime() - new Date(a.data.date).getTime(),
+);
+---
+
+<BaseLayout title="Rémy Frenoy — Blog" currentPath="/blog/">
+  <h2>Blog</h2>
+
+  {
+    posts.length > 0 ? (
+      <ul class="post-list">
+        {posts.map((post) => (
+          <li>
+            <h3>
+              <a href={`/blog/${post.id}/`}>{post.data.title}</a>
+            </h3>
+            <span class="post-date">{post.data.date}</span>
+            {post.data.description && (
+              <p class="post-description">{post.data.description}</p>
+            )}
+          </li>
+        ))}
+      </ul>
+    ) : (
+      <p>No posts yet — coming soon.</p>
+    )
+  }
+</BaseLayout>
