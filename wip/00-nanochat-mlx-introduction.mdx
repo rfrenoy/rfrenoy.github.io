@@ -1,0 +1,98 @@
+---
+title: "nanochat-mlx #0: What is nanochat? What is MLX?"
+date: "2026-03-10"
+description: "Introducing a series where we port Karpathy's nanochat to Apple Silicon using MLX, explaining both along the way."
+series: "nanochat-mlx"
+---
+
+import CodeCompare from '../../components/CodeCompare.astro';
+
+This is the first post in a series where I port [nanochat](https://github.com/karpathy/nanochat) — Andrej Karpathy's minimal full-stack LLM training harness — to run natively on Apple Silicon using [MLX](https://github.com/ml-explore/mlx). Along the way, I'll explain both the core concepts behind nanochat and the key ideas behind MLX.
+
+## What is nanochat?
+
+nanochat is the simplest experimental harness for training LLMs from scratch. In about 2,000 lines of Python, it covers the entire pipeline:
+
+1. **Tokenizer training** — BPE tokenizer in the style of GPT-4
+2. **Pretraining** — training a GPT transformer on web text
+3. **Supervised fine-tuning (SFT)** — turning a base model into a chatbot
+4. **Reinforcement learning (RL)** — improving the chatbot with reward signals
+5. **Evaluation** — measuring model quality (CORE score, bits-per-byte)
+6. **Inference** — efficient generation with KV caching
+7. **Chat UI** — a ChatGPT-style web interface
+
+The entire codebase is controlled by a single dial: `--depth`, the number of transformer layers. Everything else — model width, number of heads, learning rate, training horizon, weight decay — is computed automatically to be optimal. GPT-2 level capability happens around depth 24–26 and costs about \$48 on an 8×H100 node.
+
+## What is MLX?
+
+MLX is Apple's array computation framework, designed specifically for Apple Silicon. Think of it as a NumPy/PyTorch hybrid that understands the unique hardware of M-series chips.
+
+The key differences from PyTorch:
+
+- **Unified memory.** On Apple Silicon, CPU and GPU share the same memory. There is no `tensor.to("cuda")` — data is already accessible to both. MLX exploits this: no copies, no transfers.
+
+- **Lazy evaluation.** Operations aren't executed immediately. When you write `y = mx.matmul(a, b)`, MLX records the operation but doesn't compute it yet. Actual computation happens when you call `mx.eval(y)` or when a value is needed (e.g., printing). This lets MLX fuse operations and optimize the computation graph.
+
+- **Functional autodiff.** PyTorch builds a tape during the forward pass and calls `.backward()`. MLX uses functional transforms: you write a pure loss function, then `mx.value_and_grad(loss_fn)` returns a new function that computes both the loss and gradients. No global state, no `torch.no_grad()` context managers.
+
+## A taste of the differences
+
+Here's a preview of what the translation looks like. RMS normalization — used before every attention and MLP block:
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`def norm(x):
+    return F.rms_norm(x, (x.size(-1),))`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`def norm(x):
+    return mx.fast.rms_norm(x, weight=None, eps=1e-5)`}
+/>
+
+And here's how rotary position embeddings work. nanochat precomputes cos/sin tables and applies them manually (~30 lines). MLX has a fused kernel:
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`# Precompute (in __init__)
+cos, sin = self._precompute_rotary_embeddings(seq_len, head_dim)
+self.register_buffer("cos", cos)
+self.register_buffer("sin", sin)
+
+# Apply (in forward)
+def apply_rotary_emb(x, cos, sin):
+    d = x.shape[3] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3)
+
+q = apply_rotary_emb(q, cos, sin)
+k = apply_rotary_emb(k, cos, sin)`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`# No precomputation needed — one call does it all
+q = mx.fast.rope(q, dims=head_dim, traditional=False,
+                 base=100000.0, scale=1.0, offset=0)
+k = mx.fast.rope(k, dims=head_dim, traditional=False,
+                 base=100000.0, scale=1.0, offset=0)`}
+/>
+
+The math is the same: rotate pairs of dimensions by position-dependent angles. But MLX's fused kernel handles the precomputation, storage, and application in one call.
+
+## Why port nanochat to MLX?
+
+Three reasons:
+
+1. **Pedagogy.** Translating a codebase forces you to understand every line. By showing PyTorch and MLX side by side, we learn both frameworks deeply.
+
+2. **Apple Silicon native.** Millions of developers have M-series MacBooks. MLX is the only framework designed from scratch for this hardware. PyTorch's MPS backend works but has rough edges and doesn't exploit unified memory.
+
+3. **It doesn't exist yet.** There are MLX projects for *inference* (mlx-lm) and *fine-tuning*, but nobody has built a complete from-scratch training pipeline in MLX. nanochat-mlx will be the first.
+
+## What's next
+
+In the next post, we'll build the GPT transformer model in MLX — the heart of nanochat. We'll translate every component: embeddings, attention with rotary encodings, the MLP, and wire them together into a model that can do a forward pass and generate text.
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V
+$$
+
+Stay tuned.

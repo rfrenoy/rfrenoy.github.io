@@ -1,0 +1,211 @@
+---
+title: "nanochat-mlx #4: Feeding data to the model"
+date: "2026-03-14"
+description: "How to go from raw web text to training batches — tokenization, BOS-aligned best-fit packing, and why MLX's unified memory makes the data pipeline simpler."
+series: "nanochat-mlx"
+---
+
+import CodeCompare from '../../components/CodeCompare.astro';
+
+We have a model ([post 1](/blog/01-gpt-model/)) and a training loop ([post 3](/blog/03-training-loop/)). But so far we've only trained on 100K tokens of repeated literary quotes. Time to plug in real data.
+
+Training a language model means predicting the next token, billions of times. The data pipeline's job is to keep the GPU fed: take raw text from disk, tokenize it, and pack it into dense batches as fast as the model can consume them.
+
+This sounds simple, but there's a subtle design decision that has a meaningful impact on what the model learns: how do you pack multiple documents into fixed-length training rows?
+
+## The dataset: ClimbMix-400B
+
+nanochat trains on [ClimbMix-400B](https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle), a curated web text dataset. It's distributed as ~6,500 parquet files, each containing batches of text documents. The last shard is reserved for validation; everything else is training data.
+
+Our download script is a straightforward port — same URLs, same shard format:
+
+```bash
+# Download 5 training shards + 1 validation shard (~120MB)
+python -m nanochat_mlx.dataset -n 5
+```
+
+Each shard is a parquet file with a single `text` column. We iterate through row groups, yielding batches of document strings to the dataloader.
+
+## The packing problem
+
+A language model trains on fixed-length sequences (say $T = 2048$ tokens). But documents vary wildly in length — some are 50 tokens, others 50,000. You need to pack them into rows of exactly $T$ tokens.
+
+The simplest approach is **concatenation**: glue documents together end-to-end, then chop into fixed-length chunks:
+
+```
+Doc A (300 tok) | Doc B (1500 tok) | Doc C (800 tok) | Doc D ...
+[--- row 1 (2048 tokens) --------][--- row 2 (2048 tokens) ---]...
+```
+
+This is efficient (zero waste), but has a problem. In the middle of row 1, the model transitions from document A to document B with no signal. Tokens from document B attend back to tokens from document A — which is a completely unrelated text. The model has to learn that these cross-document tokens are meaningless, wasting capacity.
+
+## BOS-aligned packing
+
+nanochat uses a better approach: **every row starts with a BOS (beginning-of-sequence) token**, and documents are packed so each one starts fresh after a BOS boundary. The rule: each document is prepended with BOS before packing.
+
+```
+[BOS DocA... BOS DocB... BOS DocC_cropped]  ← row 1 (exactly T+1 tokens)
+[BOS DocD... BOS DocE... BOS DocF_cropped]  ← row 2
+```
+
+Every token in the sequence can attend back to a BOS token and find a coherent document context. The model never has to "unlearn" cross-document attention patterns.
+
+The cost is that some documents get **cropped** — their tail is discarded to fit the row boundary. At $T = 2048$, roughly 35% of all tokens are lost to cropping. This sounds wasteful, but the cleaner training signal more than compensates.
+
+## The best-fit algorithm
+
+Naive greedy packing (take the next document, stuff it in) wastes space because you'll often have a gap at the end of a row that's too small for the next document in line, forcing a large crop. nanochat uses **best-fit packing** to minimize this:
+
+For each row:
+1. Maintain a buffer of ~1000 tokenized documents
+2. Find the **largest** document that fits entirely in the remaining space
+3. Pack it and repeat step 2
+4. When no document fits, **crop the shortest** document to fill the gap exactly
+
+This is a greedy bin-packing heuristic. It favors packing large documents first (maximizing utilization), and when cropping is inevitable, it crops the shortest document (minimizing the fraction of text lost).
+
+The result: 100% utilization (every position is filled — no padding tokens) with reduced cropping compared to naive packing.
+
+## The code
+
+The core packing loop is almost identical between PyTorch and MLX — it's pure Python operating on lists of token IDs. The differences are all in how we get data onto the device:
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`# Pre-allocate: CPU pinned → GPU buffers
+row_buffer = torch.empty(
+    (B, row_capacity), dtype=torch.long)
+cpu_buffer = torch.empty(
+    2*B*T, dtype=torch.long, pin_memory=True)
+gpu_buffer = torch.empty(
+    2*B*T, dtype=torch.long, device="cuda")
+# ...views for inputs/targets...
+
+# After packing all rows:
+cpu_inputs.copy_(row_buffer[:, :-1])
+cpu_targets.copy_(row_buffer[:, 1:])
+gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+yield inputs, targets, state_dict`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`# Pre-allocate: just a numpy buffer
+row_buffer = np.empty(
+    (batch_size, row_capacity), dtype=np.int32)
+
+
+
+
+# After packing all rows:
+full = mx.array(row_buffer)
+x = full[:, :-1]   # (B, T)
+y = full[:, 1:]    # (B, T)
+yield x, y, state`}
+/>
+
+The PyTorch version does a careful dance: pack into a CPU buffer, copy to pinned memory, then do a non-blocking GPU transfer. This is because CPU and GPU have separate memory pools in CUDA — getting data from one to the other is a bottleneck that requires explicit management.
+
+The MLX version is simpler: convert the numpy buffer to an `mx.array` and slice it. There's no CPU→GPU transfer because **MLX's unified memory means the array is already accessible to the GPU**. The `mx.array(row_buffer)` call copies the data once (from Python/numpy space into MLX's memory pool), and then both the CPU and GPU can see it.
+
+This removes an entire class of performance concerns. In the PyTorch version, you'd typically run the dataloader in a background thread and prefetch batches to overlap I/O with computation. In MLX, the "transfer" is a memcpy within unified memory — fast enough that prefetching is rarely needed.
+
+## The packing loop itself
+
+Here's the best-fit algorithm. This code is nearly identical in both versions — it's the same greedy bin-packing:
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`while pos < row_capacity:
+    while len(doc_buffer) < buffer_size:
+        refill_buffer()
+
+    remaining = row_capacity - pos
+    best_idx, best_len = -1, 0
+    for i, doc in enumerate(doc_buffer):
+        doc_len = len(doc)
+        if doc_len <= remaining and doc_len > best_len:
+            best_idx = i
+            best_len = doc_len
+
+    if best_idx >= 0:
+        doc = doc_buffer.pop(best_idx)
+        row_buffer[row_idx, pos:pos+len(doc)] = \\
+            torch.tensor(doc, dtype=torch.long)
+        pos += len(doc)
+    else:
+        shortest_idx = min(range(len(doc_buffer)),
+            key=lambda i: len(doc_buffer[i]))
+        doc = doc_buffer.pop(shortest_idx)
+        row_buffer[row_idx, pos:pos+remaining] = \\
+            torch.tensor(doc[:remaining], dtype=torch.long)
+        pos += remaining`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`while pos < row_capacity:
+    while len(doc_buffer) < buffer_size:
+        refill_buffer()
+
+    remaining = row_capacity - pos
+    best_idx, best_len = -1, 0
+    for i, doc in enumerate(doc_buffer):
+        doc_len = len(doc)
+        if doc_len <= remaining and doc_len > best_len:
+            best_idx = i
+            best_len = doc_len
+
+    if best_idx >= 0:
+        doc = doc_buffer.pop(best_idx)
+        row_buffer[row_idx, pos:pos+len(doc)] = \\
+            doc
+        pos += len(doc)
+    else:
+        shortest_idx = min(range(len(doc_buffer)),
+            key=lambda i: len(doc_buffer[i]))
+        doc = doc_buffer.pop(shortest_idx)
+        row_buffer[row_idx, pos:pos+remaining] = \\
+            doc[:remaining]
+        pos += remaining`}
+/>
+
+The only difference: PyTorch wraps token lists in `torch.tensor()` before assigning to the buffer; we assign directly to a numpy array. The algorithm is identical.
+
+## What we dropped: DDP sharding
+
+nanochat's dataloader handles **distributed data parallel** (DDP) — when training across multiple GPUs, each rank reads a different subset of the data:
+
+```python
+# nanochat: each GPU reads every Nth row group
+rg_idx = ddp_rank  # start from this rank's offset
+while rg_idx < pf.num_row_groups:
+    rg = pf.read_row_group(rg_idx)
+    # ...process...
+    rg_idx += ddp_world_size  # skip to next assigned row group
+```
+
+We don't need this. Apple Silicon has a single unified GPU — there's no multi-device data sharding. Our iterator simply reads every row group in order:
+
+```python
+for rg_idx in range(pf.num_row_groups):
+    rg = pf.read_row_group(rg_idx)
+    texts = rg.column("text").to_pylist()
+    yield texts
+```
+
+This removed about 30 lines of resume-state tracking, rank-aware indexing, and epoch management that nanochat needs for correct multi-GPU training.
+
+## The full picture
+
+Here's how the data flows from disk to training step:
+
+```
+Parquet files on disk
+  → document_batches():   yields batches of text strings
+  → tokenizer.encode():   text → list[int] with BOS prepended
+  → best-fit packing:     pack into (B, T+1) numpy buffer
+  → mx.array():           convert to MLX array (unified memory)
+  → full[:, :-1], full[:, 1:]:  split into (x, y) for next-token prediction
+  → training step:        loss_and_grad_fn(model, x, y)
+```
+
+Each stage is a Python generator, so data flows lazily — we only tokenize and pack when the training loop asks for the next batch.
+
+## What's next
+
+With real data flowing, the remaining bottleneck is the optimizer. nanochat doesn't use plain AdamW — it uses **Muon**, an optimizer that orthogonalizes gradients via polar decomposition. Muon converges significantly faster for transformer training. In the next post, we'll port it to MLX.

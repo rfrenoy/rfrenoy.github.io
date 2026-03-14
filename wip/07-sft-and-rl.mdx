@@ -1,0 +1,145 @@
+---
+title: "nanochat-mlx #7: From base model to chatbot — SFT and RL"
+date: "2026-03-17"
+description: "How supervised fine-tuning teaches a base model to chat, how reinforcement learning teaches it to reason, and what changes in MLX."
+series: "nanochat-mlx"
+---
+
+import CodeCompare from '../../components/CodeCompare.astro';
+
+A base language model predicts the next token. It can complete text, but it doesn't know how to have a conversation. If you prompt it with "What is 2+2?" it's just as likely to continue with another question as to answer yours.
+
+The bridge from "text predictor" to "chatbot" has two stages:
+
+1. **Supervised Fine-Tuning (SFT)**: teach the model the format of a conversation — user asks, assistant answers
+2. **Reinforcement Learning (RL)**: teach the model to produce *correct* answers, using reward signals
+
+## SFT: learning to chat
+
+SFT is conceptually simple: take a pretrained base model and continue training it on conversation data. The key difference from pretraining is the **supervision mask**.
+
+In pretraining, the model learns from every token — input and output are the same stream, shifted by one. In SFT, we only want the model to learn the *assistant's* responses, not to memorize user questions or structural tokens.
+
+nanochat uses special tokens to mark conversation structure:
+
+```
+<|bos|><|user_start|>What is 2+2?<|user_end|><|assistant_start|>4<|assistant_end|>
+```
+
+The supervision mask is 1 for "4" and the `<|assistant_end|>` token, and 0 for everything else. During training, masked positions get `target = -1` (the ignore index for cross-entropy), so they don't contribute to the loss or gradients.
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch) — SFT masking"
+  leftCode={`# Apply supervision mask from render_conversation
+# mask=1 for assistant completions only
+mask_tensor = torch.tensor(mask_rows, dtype=torch.int8)
+mask_targets = mask_tensor[:, 1:].to(device)
+targets[mask_targets == 0] = -1
+
+# Also mask padding positions
+for i, content_len in enumerate(row_lengths):
+    if content_len < row_capacity:
+        targets[i, content_len-1:] = -1`}
+  rightTitle="nanochat-mlx (MLX) — SFT masking"
+  rightCode={`# Apply supervision mask from render_conversation
+# mask=1 for assistant completions only
+mask = mx.array(mask_buffer[:, 1:])
+y = mx.where(
+    mask == 1,
+    y_raw,
+    mx.full(y_raw.shape, -1, dtype=y_raw.dtype)
+)
+
+# Padding already has mask=0,
+# handled by the mx.where above`}
+/>
+
+The packing algorithm is almost identical to pretraining's best-fit packing, with one difference: when no conversation fits the remaining space in a row, we **pad** instead of cropping. In pretraining, we crop documents because we have billions of tokens and losing 35% to cropping is fine. In SFT, we have fewer conversations and don't want to lose any — especially partial conversations that would be confusing to train on.
+
+## The data mixture
+
+nanochat trains SFT on a mixture of tasks:
+
+| Task | Size | Purpose |
+|------|------|---------|
+| SmolTalk | 460K convos | General conversation ability |
+| MMLU | 100K × 3 epochs | Multiple choice knowledge |
+| GSM8K | 8K × 4 epochs | Math with tool use |
+| SimpleSpelling | 200K | Basic spelling |
+| SpellingBee | 80K | Letter counting |
+| Identity | 1K × 2 | Who am I? responses |
+
+The `TaskMixture` class shuffles all these deterministically so tasks are interleaved throughout training. Oversampling is trivial — just include a task multiple times in the list.
+
+## RL: learning to reason
+
+SFT teaches format; RL teaches quality. nanochat uses a simplified form of [GRPO](https://arxiv.org/abs/2402.03300) on GSM8K (grade school math problems) that boils down to REINFORCE:
+
+1. Sample the model's prompt from the dataset
+2. Generate $K$ completions per prompt
+3. Score each completion (correct answer = reward 1, wrong = reward 0)
+4. Compute advantage = reward - mean(rewards)
+5. Update: increase probability of high-advantage tokens, decrease low-advantage
+
+The loss is:
+
+$$\mathcal{L} = -\frac{1}{N_\text{valid}} \sum_{i} \log p(t_i) \cdot A_i$$
+
+where $A_i$ is the per-sample advantage broadcast to all tokens in that sample, and $N_\text{valid}$ counts only non-masked tokens.
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch) — RL loss"
+  leftCode={`# Log probabilities (negate NLL)
+logp = -model(inputs, targets, loss_reduction='none')
+
+# Policy gradient objective
+pg_obj = (logp * advantages.unsqueeze(-1)).sum()
+
+# Normalize by valid tokens and batch structure
+num_valid = (targets >= 0).sum().clamp(min=1)
+pg_obj = pg_obj / (num_valid * num_passes * examples_per_rank)
+
+# Minimize negative objective
+loss = -pg_obj
+loss.backward()`}
+  rightTitle="nanochat-mlx (MLX) — RL loss"
+  rightCode={`# Per-token NLL (not negated — MLX CE returns positive values)
+nll = model(inputs, targets=targets, loss_reduction='none')
+
+# Policy gradient: weight NLL by advantages
+pg_obj = nll * advantages[:, None]
+
+# Only count valid tokens
+valid = (targets >= 0).astype(pg_obj.dtype)
+num_valid = mx.maximum(mx.sum(valid), mx.array(1.0))
+
+# Loss: reward-weighted NLL (no sign flip needed)
+loss = mx.sum(pg_obj * valid) / num_valid`}
+/>
+
+nanochat's simplifications from standard GRPO:
+- **No trust region**: no KL divergence penalty against a reference model
+- **On-policy**: since we sample fresh each step, no importance weights (PPO ratio+clip)
+- **Simple centering**: advantage = reward - mean, not full z-score normalization
+
+These simplifications work because the model is always on-policy (we sample, compute loss, update immediately) and the reward is binary (correct or not).
+
+## What we dropped
+
+The full nanochat SFT pipeline has several things we simplified:
+
+**Warm-starting the optimizer.** nanochat loads the momentum buffers from the pretrained checkpoint, so the optimizer "remembers" the training dynamics. We start fresh.
+
+**Muon momentum scheduling.** nanochat ramps Muon's momentum from 0.85 to 0.95 over the first 300 steps. We keep it fixed.
+
+**ChatCORE evaluation.** nanochat periodically evaluates on a suite of chat benchmarks (ARC, MMLU, GSM8K, HumanEval, SpellingBee). We don't have this yet.
+
+**Checkpointing.** nanochat saves model + optimizer state for resumable training. We train from scratch each time.
+
+**wandb logging.** nanochat logs metrics to Weights & Biases. We print to stdout.
+
+These are all engineering concerns rather than algorithmic ones. The core SFT algorithm (masked cross-entropy on conversations) and RL algorithm (REINFORCE with centered advantages) are faithfully ported.
+
+## What's next
+
+With SFT and RL in place, we have the complete training pipeline: pretrain → SFT → RL. The final piece is putting it all together with a chat interface — that's Phase 8.

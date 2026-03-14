@@ -1,14 +1,14 @@
 ---
 title: "Automating Product Demo Videos with AI and Remotion"
 date: "2026-03-13"
-description: "Building a CLI that turns product screenshots into polished 20-second demo videos, using Claude's vision capabilities and Remotion's React-based video engine."
+description: "Building a tool that turns product screenshots into polished 30-second demo videos, using Claude's vision capabilities and Remotion's React-based video engine."
 ---
 
-*[Source code on GitHub](https://github.com/rfrenoy/auto-product-demo)*
+*[Source code on GitHub](https://github.com/rfrenoy/auto-product-demo) · [Try it at getproductdemo.app](https://getproductdemo.app)*
 
 Every SaaS product needs a demo video. For landing pages, for social media, for investor decks.  
 
-And yet, making even a simple 20-second product walkthrough is a lot of effort: screen recording, editing, motion graphics, export. It's either expensive (hire someone) or time-consuming (learn After Effects). It is worthwhile when your product is mature, but for an early-stage product, spending that much time on a marketing video you may throw away in a few weeks makes little sense. Yet you would still like to have something to show people what you are building. That's where this project comes in.
+And yet, making even a simple 30-second product walkthrough is a lot of effort: screen recording, editing, motion graphics, export. It's either expensive (hire someone) or time-consuming (learn After Effects). It is worthwhile when your product is mature, but for an early-stage product, spending that much time on a marketing video you may throw away in a few weeks makes little sense. Yet you would still like to have something to show people what you are building. That's where this project comes in.
 
 ## The idea
 
@@ -42,12 +42,12 @@ The core of the project is a conversation with Claude Sonnet 4.6. We send:
 - The product name and tagline
 - A detailed system prompt with two roles: *video producer* (what to create) and *Remotion developer* (how to create it)
 
-The system prompt instructs Claude to look at the screenshots and extract the color palette, layout patterns, and key features, then generate a single self-contained React component (`ProductDemo.tsx`) that renders an animated 20-second video.
+The system prompt instructs Claude to look at the screenshots and extract the color palette, layout patterns, and key features, then generate a single self-contained React component (`ProductDemo.tsx`) that renders an animated 30-second video.
 
 The video follows a fixed structure:
-- <mark>Intro (0–3s)</mark>: Product name with an entrance animation
-- <mark>Feature showcase (3–15s)</mark>: Animated mockup: UI elements appear sequentially (sidebar slides in, cards fade in, buttons appear)
-- <mark>Tagline (15–20s)</mark>: Value proposition, centered, with a clean transition
+- <mark>Intro (0–4s)</mark>: Product name with an entrance animation
+- <mark>Feature showcase (4–24s)</mark>: Split-screen scenes — animated UI mockups on one side, value proposition text on the other. Elements appear sequentially (sidebar slides in, cards fade in, buttons appear)
+- <mark>Tagline (24–30s)</mark>: Value proposition, centered, with a clean transition
 
 ### The Remotion skills
 
@@ -147,13 +147,21 @@ Constraining the agent to output a single `ProductDemo.tsx` file reduces the sur
 
 Three reasons: determinism (we control exactly what version of the skills we use), speed (no network call on every run), and customizability (we can tweak the skills as we learn what works).
 
+## From CLI to web app
+
+After building the CLI, I turned it into a web product: [getproductdemo.app](https://getproductdemo.app). Upload your screenshots, enter your product name and tagline, and get a video delivered to your inbox in a couple of minutes. No API key needed, no local setup.
+
+The web version adds a few things on top of the CLI: Stripe payments, email delivery of the finished video (so you can close the tab while it renders), automatic refunds if generation fails, and a job queue for handling concurrent requests.
+
+If you'd rather run it yourself, the [CLI is open source](https://github.com/rfrenoy/auto-product-demo) and works with your own Anthropic API key.
+
 ## What's next
 
-This is a v1. A few things I'd like to explore:
+A few things I'd like to explore:
 
 - <mark>Configurable video specs</mark>: let users choose resolution, duration, and aspect ratio (vertical for social, square for Instagram, etc.)
 - <mark>Music and sound effects</mark>: Remotion supports audio. Adding a subtle background track could be a simple but nice addition.
 
 ---
 
-*The project is built with TypeScript, [Remotion](https://remotion.dev), and the [Anthropic SDK](https://docs.anthropic.com). It runs entirely locally. No server, no cloud rendering.*
+*The project is built with TypeScript, [Remotion](https://remotion.dev), and the [Anthropic SDK](https://docs.anthropic.com). The CLI runs entirely locally. The web version is hosted at [getproductdemo.app](https://getproductdemo.app).*

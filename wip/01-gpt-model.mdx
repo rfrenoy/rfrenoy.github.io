@@ -1,0 +1,631 @@
+---
+title: "nanochat-mlx #1: Building a GPT from scratch in MLX"
+date: "2026-03-11"
+description: "We build a GPT transformer model in MLX, component by component — explaining the math and engineering behind each piece, and showing how it differs from Karpathy's PyTorch implementation."
+series: "nanochat-mlx"
+---
+
+import CodeCompare from '../../components/CodeCompare.astro';
+
+In the [previous post](/blog/00-nanochat-mlx-introduction/), we introduced nanochat and MLX. Now we build the actual model — a GPT transformer — from scratch in MLX. We'll go component by component, understanding the *why* before the *how*, showing the math, and comparing with Karpathy's PyTorch implementation.
+
+By the end, we'll have a model that can take a sequence of token IDs and produce predictions for the next token. We'll also be able to compute gradients through the entire thing, which is everything you need to train it. But first, let's zoom out.
+
+## What does a GPT actually do?
+
+At the highest level, a GPT is a function:
+
+$$
+\text{tokens} \xrightarrow{\text{GPT}} \text{probabilities over next token}
+$$
+
+You feed in a sequence of token IDs like `[Hello, ·world, ·how]` and it outputs a probability distribution over the vocabulary for each position. The prediction at the last position tells you what token is most likely to come next.
+
+The model is a stack of identical *blocks*, each consisting of two sub-layers: **attention** (tokens talk to each other) and **MLP** (each token "thinks" independently). Between these, we normalize, and around them, we add residual connections.
+
+Here's the full data flow. Every piece of this is what we're building today:
+
+```
+Token IDs [B, T]
+    │
+    ▼
+Embedding lookup ──► x₀ [B, T, D]
+    │
+    ▼
+RMSNorm
+    │
+    ├─── save as x₀ (for skip connections)
+    │
+    ▼
+┌─────────── Block 0 ───────────┐
+│ λ_resid · x + λ_x0 · x₀      │
+│       │                        │
+│   RMSNorm → Attention → + x   │
+│       │                        │
+│   RMSNorm → MLP → + x         │
+└────────────────────────────────┘
+    │
+    ▼
+    ... (repeat N times)
+    │
+    ▼
+RMSNorm
+    │
+    ▼
+Linear (lm_head) → logits [B, T, V]
+    │
+    ▼
+Soft-cap to [-15, 15]
+    │
+    ▼
+Cross-entropy loss (if training)
+```
+
+Let's build each component.
+
+## 1. Turning tokens into vectors: Embeddings
+
+A token ID is just an integer — say, `4217`. The model's first job is to turn it into a *vector* that it can manipulate. This is done by an **embedding table**: a matrix $W_e \in \mathbb{R}^{V \times D}$, where $V$ is the vocabulary size and $D$ is the model dimension.
+
+Looking up token $i$ simply means grabbing row $i$ of this matrix:
+
+$$
+\mathbf{x}_i = W_e[i, :]
+$$
+
+There's no math beyond indexing. The values in $W_e$ are learned during training — the model discovers what vector representation is useful for each token.
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`self.transformer = nn.ModuleDict({
+    "wte": nn.Embedding(padded_vocab_size, config.n_embd),
+    "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+})
+self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`self.wte = nn.Embedding(padded_vocab_size, config.n_embd)
+self.blocks = [Block(config, i) for i in range(config.n_layer)]
+self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)`}
+/>
+
+In PyTorch, you need `nn.ModuleDict` and `nn.ModuleList` so that the framework discovers your sub-modules for parameter tracking, `.to(device)` calls, etc. In MLX, `nn.Module` automatically discovers any `mx.array`, `list`, or `dict` attributes — so plain Python data structures just work.
+
+Note: the vocab size is padded to a multiple of 64 for hardware efficiency (tensor core alignment). The extra rows are never used — we crop the logits back to the real vocab size at the end.
+
+## 2. RMSNorm: keeping numbers in check
+
+Deep networks suffer from **internal covariate shift** — the distribution of values at each layer keeps changing during training, making learning unstable. Normalization fixes this by rescaling vectors to unit norm.
+
+nanochat uses **RMS normalization** (Root Mean Square), which is simpler than LayerNorm because it skips the mean subtraction:
+
+$$
+\text{RMSNorm}(\mathbf{x}) = \frac{\mathbf{x}}{\sqrt{\frac{1}{D}\sum_{i=1}^D x_i^2 + \epsilon}}
+$$
+
+where $\epsilon$ is a small constant (like $10^{-5}$) to avoid division by zero.
+
+The intuition: imagine each token's vector as an arrow in $D$-dimensional space. RMSNorm rescales the arrow so its average squared component is 1, without changing its direction. This keeps numbers from growing or shrinking as they pass through dozens of layers.
+
+Importantly, nanochat uses **no learnable parameters** in its RMSNorm — no $\gamma$ (scale) or $\beta$ (shift). Just the raw normalization. This is a deliberate simplicity choice.
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`def norm(x):
+    return F.rms_norm(x, (x.size(-1),))`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`def norm(x):
+    return mx.fast.rms_norm(x, weight=None, eps=1e-5)`}
+/>
+
+Both use a fused kernel for speed. In MLX, passing `weight=None` means "no learnable scale parameter."
+
+## 3. The MLP: where each token thinks alone
+
+After attention (where tokens communicate), each token passes through an MLP — a simple two-layer feed-forward network. This is where the model does most of its "thinking", transforming each token's representation independently.
+
+$$
+\text{MLP}(\mathbf{x}) = W_{\text{proj}} \cdot \text{ReLU}(W_{\text{fc}} \cdot \mathbf{x})^2
+$$
+
+The activation function is **ReLU²** — that is, $\max(0, z)^2$. Why squared? It creates sparser activations than plain ReLU (the squaring suppresses small positive values) while being smooth and easy to optimize. It was introduced in the [Primer paper](https://arxiv.org/abs/2109.08668) and used in many modern architectures.
+
+The shapes tell the story: $W_{\text{fc}}$ projects from $D$ to $4D$ (expanding), and $W_{\text{proj}}$ projects back from $4D$ to $D$ (compressing). The 4× expansion gives the model a wider "workspace" to manipulate representations before projecting back down.
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square()
+        x = self.c_proj(x)
+        return x`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def __call__(self, x):
+        x = self.c_fc(x)
+        x = mx.square(nn.relu(x))
+        x = self.c_proj(x)
+        return x`}
+/>
+
+Almost identical. Two differences: MLX uses `__call__` instead of `forward` (MLX modules are callable directly), and nanochat uses a custom `Linear` class that casts weights from fp32 to bf16 during the forward pass — a mixed-precision trick that isn't needed in MLX (more on this later).
+
+## 4. Attention: the heart of the transformer
+
+Attention is the mechanism that lets tokens communicate. The intuition: every token *queries* the other tokens ("what information is relevant to me?"), every token provides *keys* ("here's what I'm about") and *values* ("here's my information"). The output for each token is a weighted average of all values, where the weights come from how well each query matches each key.
+
+### The math
+
+Given an input $X \in \mathbb{R}^{T \times D}$ (a sequence of $T$ token vectors), we project to queries, keys, and values:
+
+$$
+Q = X W_Q, \quad K = X W_K, \quad V = X W_V
+$$
+
+Then split each into $H$ heads (each of dimension $d = D/H$) and compute:
+
+$$
+\text{head}_i = \text{softmax}\left(\frac{Q_i K_i^T}{\sqrt{d}}\right) V_i
+$$
+
+The $\frac{1}{\sqrt{d}}$ scaling prevents the dot products from becoming too large (which would push softmax into saturation — all weight on one token, zero gradient flow).
+
+The result is concatenated across heads and projected back:
+
+$$
+\text{Attention}(X) = \text{Concat}(\text{head}_1, \ldots, \text{head}_H) \, W_O
+$$
+
+### Causal masking
+
+GPT is *autoregressive*: when predicting token $t$, it can only look at tokens $1, \ldots, t$ (not future tokens). This is enforced with a **causal mask** — an upper-triangular matrix of $-\infty$ values added to the attention scores before softmax, which zeroes out attention to future positions.
+
+### What nanochat adds on top
+
+The vanilla attention formula above is what the original 2017 Transformer paper described. nanochat's GPT adds several modern refinements:
+
+**QK-Norm.** Instead of the standard $\frac{1}{\sqrt{d}}$ scaling, nanochat normalizes Q and K with RMSNorm after applying rotary embeddings, then scales by 1.15:
+
+$$
+Q' = 1.15 \cdot \text{RMSNorm}(Q), \quad K' = 1.15 \cdot \text{RMSNorm}(K)
+$$
+
+This keeps attention logits well-behaved regardless of model size. QK-norm has roots in [Scaling ViT](https://arxiv.org/abs/2302.05442) and [nGPT](https://arxiv.org/abs/2410.01131); the specific variant used in nanochat (RMSNorm + a fixed 1.15 sharpening factor) comes from community experiments in [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt).
+
+**Group-Query Attention (GQA).** In standard multi-head attention, Q, K, and V each have $H$ heads. GQA uses fewer key/value heads ($H_{kv} < H_q$), with multiple query heads sharing the same key/value head. This dramatically reduces the KV cache size during inference — critical for serving large models.
+
+For example, with 8 query heads and 2 KV heads, every group of 4 query heads shares one set of keys and values. The math is the same; the dimensions just differ:
+
+$$
+Q \in \mathbb{R}^{B \times H_q \times T \times d}, \quad K, V \in \mathbb{R}^{B \times H_{kv} \times T \times d}
+$$
+
+Both PyTorch's SDPA and MLX's `scaled_dot_product_attention` handle this broadcasting natively.
+
+### The code
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`# Q, K, V: (B, T, H, D) — FA3's native layout
+q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+# Rotary embeddings + QK norm
+cos, sin = cos_sin
+q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+q, k = norm(q), norm(k)
+q = q * 1.15
+k = k * 1.15
+
+# Flash Attention (FA3 on Hopper, SDPA fallback elsewhere)
+y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`# Q, K, V: (B, H, T, D) — MLX SDPA's native layout
+q = self.c_q(x).reshape(B, T, self.n_head, self.head_dim)
+k = self.c_k(x).reshape(B, T, self.n_kv_head, self.head_dim)
+v = self.c_v(x).reshape(B, T, self.n_kv_head, self.head_dim)
+# Transpose to (B, H, T, D) for RoPE and SDPA
+q = q.transpose(0, 2, 1, 3)
+k = k.transpose(0, 2, 1, 3)
+v = v.transpose(0, 2, 1, 3)
+
+# Rotary embeddings + QK norm
+q = mx.fast.rope(q, dims=self.head_dim, traditional=False,
+                 base=100000.0, scale=1.0, offset=offset)
+k = mx.fast.rope(k, dims=self.head_dim, traditional=False,
+                 base=100000.0, scale=1.0, offset=offset)
+q = norm(q) * 1.15
+k = norm(k) * 1.15
+
+# MLX scaled dot-product attention
+y = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)`}
+/>
+
+The most visible difference is the **tensor layout**. Flash Attention 3 (used by nanochat on Hopper GPUs) expects `(B, T, H, D)` — batch, sequence, heads, head_dim. MLX's SDPA expects `(B, H, T, D)` — batch, heads, sequence, head_dim. So we transpose right after projection and transpose back after attention. Same math, different memory layout.
+
+## 5. Rotary Position Embeddings (RoPE)
+
+Here's a subtle problem: attention is **permutation-invariant**. The dot product $q_i \cdot k_j$ doesn't know whether token $j$ comes before or after token $i$ — it only sees the content. But word order matters! "The cat sat on the mat" and "The mat sat on the cat" are different sentences.
+
+**Rotary Position Embeddings** solve this by encoding position directly into the attention computation. The idea is beautifully geometric: *rotate each query and key vector by an angle proportional to its position*.
+
+### The math
+
+For a vector $\mathbf{x}$ at position $p$, group its dimensions into consecutive pairs $(x_0, x_1), (x_2, x_3), \ldots$ and rotate each pair:
+
+$$
+\begin{pmatrix} x'_{2i} \\ x'_{2i+1} \end{pmatrix} = \begin{pmatrix} \cos(p \cdot \theta_i) & -\sin(p \cdot \theta_i) \\ \sin(p \cdot \theta_i) & \cos(p \cdot \theta_i) \end{pmatrix} \begin{pmatrix} x_{2i} \\ x_{2i+1} \end{pmatrix}
+$$
+
+where $\theta_i = \frac{1}{10000^{2i/d}}$ gives different frequencies for each dimension pair — like the hour, minute, and second hands of a clock, all rotating at different speeds.
+
+### Why rotation?
+
+The key insight: when we compute the dot product $q_i \cdot k_j$ between the rotated query at position $i$ and the rotated key at position $j$, the result depends on the **relative distance** $i - j$. This is because rotating both vectors by the same angle doesn't change their dot product — only the *difference* in rotation angles matters.
+
+Think of it like this: if two clock hands are 90° apart, they're 90° apart regardless of what time it is. RoPE gives each position a unique "time", and attention naturally measures the angular difference.
+
+### Precomputed tables vs. fused kernel
+
+This is where the implementations diverge most. nanochat precomputes all cos/sin values and stores them as buffers:
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch) — ~30 lines"
+  leftCode={`def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000):
+    channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32)
+    inv_freq = 1.0 / (base ** (channel_range / head_dim))
+    t = torch.arange(seq_len, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    cos, sin = freqs.cos(), freqs.sin()
+    # Add batch and head dims for broadcasting
+    cos = cos[None, :, None, :]
+    sin = sin[None, :, None, :]
+    return cos, sin
+
+# Store as buffers (non-parameter persistent tensors)
+self.register_buffer("cos", cos, persistent=False)
+self.register_buffer("sin", sin, persistent=False)
+
+# Apply manually
+def apply_rotary_emb(x, cos, sin):
+    d = x.shape[3] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3)`}
+  rightTitle="nanochat-mlx (MLX) — 2 lines"
+  rightCode={`# Everything happens in one fused kernel call.
+# No precomputation, no buffers, no manual rotation.
+q = mx.fast.rope(
+    q,                    # input: (B, H, T, D)
+    dims=self.head_dim,   # how many dims to rotate
+    traditional=False,    # use the "non-interleaved" variant
+    base=100000.0,        # frequency base (same θ formula)
+    scale=1.0,            # no position scaling
+    offset=offset,        # position offset (for KV cache)
+)
+# Same call for keys
+k = mx.fast.rope(k, dims=self.head_dim, traditional=False,
+                 base=100000.0, scale=1.0, offset=offset)`}
+/>
+
+The math is identical. But MLX's `mx.fast.rope` is a single fused Metal kernel that computes the frequencies, builds the rotation matrices, and applies them — all in one GPU dispatch. No need to precompute tables, no need for `register_buffer`, no need for the manual `apply_rotary_emb` function.
+
+This is also where MLX's **unified memory** shines. In PyTorch, the precomputed cos/sin tensors are "buffers" that need to be tracked and moved between CPU and GPU. In MLX, there's no concept of device — the kernel simply reads from and writes to the same shared memory.
+
+## 6. Value Embeddings: the ResFormer trick
+
+This is one of nanochat's more unusual features. Standard attention computes values $V = XW_V$ from the current layer's representations. **Value embeddings** (from the [Value Residual Learning paper](https://arxiv.org/abs/2410.17897)) add a shortcut: look up the original token IDs in a *separate* embedding table and blend that into the values.
+
+$$
+V' = V + \alpha \cdot V_{\text{embed}}[\text{token\_ids}]
+$$
+
+where $\alpha$ is a learned, input-dependent gate. This gives each layer direct access to the raw token identity — a kind of "memory" shortcut that bypasses all intermediate transformations.
+
+nanochat applies this on alternating layers (the `has_ve` function), with the last layer always included. The gate $\alpha$ is computed from the first 12 channels of the input:
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`# Value residual with input-dependent gate
+if ve is not None:
+    ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+    gate = 3 * torch.sigmoid(
+        self.ve_gate(x[..., :self.ve_gate_channels])
+    )  # (B, T, n_kv_head), range (0, 3)
+    v = v + gate.unsqueeze(-1) * ve`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`# Value residual with input-dependent gate
+if ve is not None and self.ve_gate is not None:
+    ve = ve.reshape(B, T, self.n_kv_head, self.head_dim)
+    gate = 3 * mx.sigmoid(
+        self.ve_gate(x[..., :self.ve_gate_channels])
+    )  # (B, T, n_kv_head), range (0, 3)
+    v = v + mx.expand_dims(gate, axis=-1) * ve`}
+/>
+
+Identical logic. The gate output passes through sigmoid (range 0–1) then is scaled by 3 (range 0–3), giving the model freedom to amplify the value embedding contribution when useful.
+
+## 7. Sliding Window Attention
+
+Full causal attention has cost $O(T^2)$ — every token attends to all previous tokens. **Sliding window** attention limits each token to only attend to the last $W$ tokens, reducing the cost.
+
+nanochat uses a **pattern string** like `"SSSL"` that tiles across layers:
+- `L` = long (full context)
+- `S` = short (roughly 1/3 of the context length)
+- The final layer always gets full context.
+
+So in a 12-layer model with pattern `"SSSL"`, layers 0–2 use short windows, layer 3 gets full context, layers 4–6 short, layer 7 full, and so on. The last layer (11) is always full.
+
+This is a nice tradeoff: most layers only need local context, but a few layers can see the entire sequence — enough to propagate long-range information.
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`# FA3 handles sliding window natively
+# window_size is a (left, right) tuple
+# (-1, 0) = full context, (N, 0) = last N tokens
+y = flash_attn.flash_attn_func(
+    q, k, v, causal=True, window_size=window_size
+)`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`# MLX SDPA has no built-in sliding window,
+# so we build an explicit boolean mask
+if window_size < 0:
+    mask = "causal"  # full context: fast path
+else:
+    row = mx.arange(T).reshape(T, 1)
+    col = mx.arange(T).reshape(1, T)
+    mask = (col <= row) & ((row - col) <= window_size)
+
+y = mx.fast.scaled_dot_product_attention(
+    q, k, v, scale=1.0, mask=mask
+)`}
+/>
+
+Flash Attention 3 has native sliding window support — you just pass a tuple. MLX's SDPA doesn't, so we build the mask ourselves: a boolean matrix where entry $(i, j)$ is `True` if token $i$ can attend to token $j$. The string `"causal"` is a special fast-path in MLX that avoids materializing the full mask.
+
+## 8. The Block: putting it together
+
+A transformer block is two sub-layers with pre-norm residual connections:
+
+$$
+\mathbf{x} \leftarrow \mathbf{x} + \text{Attention}(\text{RMSNorm}(\mathbf{x}))
+$$
+
+$$
+\mathbf{x} \leftarrow \mathbf{x} + \text{MLP}(\text{RMSNorm}(\mathbf{x}))
+$$
+
+The *pre-norm* pattern (normalize *before* each sub-layer, not after) is critical for training stability in deep networks. The residual connection ($+ \mathbf{x}$) ensures gradients can flow directly through the network — without it, gradients would vanish after a few dozen layers.
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`class Block(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.mlp = MLP(config)
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        x = x + self.mlp(norm(x))
+        return x`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`class Block(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.mlp = MLP(config)
+
+    def __call__(self, x, ve, offset, window_size, mask):
+        x = x + self.attn(norm(x), ve, offset, window_size, mask)
+        x = x + self.mlp(norm(x))
+        return x`}
+/>
+
+Nearly identical. The signature differs because of the RoPE approach (nanochat passes precomputed `cos_sin`, MLX passes an integer `offset`) and the sliding window approach (nanochat passes a `window_size` tuple, MLX passes a pre-built `mask`).
+
+## 9. Per-layer residual scaling
+
+nanochat adds an interesting twist to the standard residual connection. Instead of a plain $x + \text{sublayer}(x)$, the forward pass does:
+
+$$
+\mathbf{x} \leftarrow \lambda_{\text{resid}}^{(i)} \cdot \mathbf{x} + \lambda_{x_0}^{(i)} \cdot \mathbf{x}_0
+$$
+
+before each block, where $\mathbf{x}_0$ is the *initial* normalized embedding (saved from right after the first RMSNorm).
+
+The $\lambda_{\text{resid}}$ scalars (initialized to 1.0) let the model learn to *dampen* the residual stream at certain layers. The $\lambda_{x_0}$ scalars (initialized to 0.1) blend in the original token embedding — a skip connection that goes all the way back to the start. This is inspired by [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) and helps training stability.
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`# Per-layer scalars (nn.Parameter)
+self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
+self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+
+# In forward:
+x = norm(x)
+x0 = x  # save initial embedding
+for i, block in enumerate(self.transformer.h):
+    x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+    ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+    x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`# Per-layer scalars (plain mx.array — auto-discovered as params)
+self.resid_lambdas = mx.ones((config.n_layer,))
+self.x0_lambdas = mx.zeros((config.n_layer,))
+
+# In __call__:
+x = norm(x)
+x0 = x  # save initial embedding
+for i, block in enumerate(self.blocks):
+    x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+    ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+    x = block(x, ve, offset, self.window_sizes[i], masks[i])`}
+/>
+
+In PyTorch, these must be wrapped in `nn.Parameter` so the autograd system knows to compute gradients for them. In MLX, any `mx.array` attribute on an `nn.Module` is automatically treated as a parameter — no wrapper needed.
+
+## 10. Logit soft-capping
+
+After the final RMSNorm and the linear projection (lm_head), we have raw logits — one score per vocabulary token. nanochat applies **soft-capping** to keep these in a reasonable range:
+
+$$
+\text{logits} = C \cdot \tanh\left(\frac{\text{logits}}{C}\right), \quad C = 15
+$$
+
+The $\tanh$ function smoothly squashes values to $(-1, 1)$, and multiplying by $C$ scales the range to $(-C, C)$. Unlike hard clipping, this is differentiable everywhere — gradients flow smoothly even for extreme values.
+
+This is a technique from [Gemma 2](https://arxiv.org/abs/2408.00118) that prevents training instabilities from logit explosions.
+
+## 11. The full forward pass
+
+Let's see how everything wires together. This is the complete forward method:
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`def forward(self, idx, targets=None, kv_cache=None):
+    B, T = idx.size()
+    # Rotary embeddings (precomputed)
+    T0 = 0 if kv_cache is None else kv_cache.get_pos()
+    cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+
+    # Embed + norm + save x0
+    x = self.transformer.wte(idx)
+    x = norm(x)
+    x0 = x
+    # Blocks
+    for i, block in enumerate(self.transformer.h):
+        x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+        ve = self.value_embeds[str(i)](idx) if ...
+        x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+    x = norm(x)
+
+    # Logits + soft-cap
+    logits = self.lm_head(x)
+    logits = logits[..., :self.config.vocab_size]
+    logits = logits.float()
+    logits = 15 * torch.tanh(logits / 15)
+
+    if targets is not None:
+        return F.cross_entropy(logits.view(-1, ...), targets.view(-1))
+    return logits`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`def __call__(self, idx, targets=None, offset=0):
+    B, T = idx.shape
+    # Build attention masks
+    mask_cache = {}
+    masks = []
+    for ws in self.window_sizes:
+        if ws not in mask_cache:
+            mask_cache[ws] = self._build_mask(T, ws)
+        masks.append(mask_cache[ws])
+
+    # Embed + norm + save x0
+    x = self.wte(idx)
+    x = norm(x)
+    x0 = x
+    # Blocks
+    for i, block in enumerate(self.blocks):
+        x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+        ve = self.value_embeds[str(i)](idx) if ...
+        x = block(x, ve, offset, self.window_sizes[i], masks[i])
+    x = norm(x)
+
+    # Logits + soft-cap
+    logits = self.lm_head(x)
+    logits = logits[..., :self.config.vocab_size]
+    logits = 15.0 * mx.tanh(logits / 15.0)
+
+    if targets is not None:
+        return nn.losses.cross_entropy(logits, targets, reduction="mean")
+    return logits`}
+/>
+
+The structure is the same. The differences reflect the framework idioms:
+- **RoPE**: nanochat slices precomputed buffers; MLX passes `offset` to the fused kernel.
+- **Masks**: nanochat passes a `window_size` tuple to FA3; MLX pre-builds boolean masks.
+- **Loss**: PyTorch's `F.cross_entropy` needs flattened inputs; MLX's `nn.losses.cross_entropy` works directly on shaped tensors.
+- **dtype**: nanochat explicitly casts logits to float32 for the softcap and loss. MLX operates in float32 by default.
+
+## 12. Gradients: functional vs. imperative
+
+This is perhaps the most profound difference between the two frameworks.
+
+In PyTorch, you call `loss.backward()` and gradients magically appear on every parameter:
+
+```python
+# PyTorch
+loss = model(x, targets)
+loss.backward()                # builds + traverses computation graph
+optimizer.step()               # updates params using .grad attributes
+model.zero_grad()              # resets .grad to None
+```
+
+In MLX, there's no implicit computation graph. Instead, you use **functional transforms** — you wrap your loss function and get back a new function that returns both the loss and the gradients:
+
+```python
+# MLX
+def loss_fn(model, x, targets):
+    return model(x, targets=targets)
+
+loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+loss, grads = loss_and_grad_fn(model, x, targets)
+
+# grads is a nested dict matching model.parameters() structure
+optimizer.update(model, grads)
+mx.eval(model.parameters(), optimizer.state)
+```
+
+No `.backward()`, no `.grad` attributes, no `zero_grad()`. The gradient is a plain Python dict tree that mirrors the parameter tree. This functional style is cleaner (no global state) but requires a different mental model.
+
+There's also a subtle consequence of MLX's **lazy evaluation**: nothing actually computes until `mx.eval(...)` is called. The `loss_and_grad_fn` call builds a computation graph; `mx.eval` executes it. This lets MLX fuse operations across the entire forward-backward pass.
+
+## 13. Does it work?
+
+After building all these components, the moment of truth is a smoke test. We create a tiny model (4 layers, 128-dim, vocab of 256) and verify:
+
+1. **Forward pass** produces logits of the right shape
+2. **Loss** at initialization is close to $-\ln(1/V) \approx 5.55$ (random guessing over 256 tokens)
+3. **Gradients** flow through all parameters
+4. **Generation** produces valid token sequences
+
+```
+$ python -m scripts.smoke_test
+
+Config: GPTConfig(sequence_len=256, vocab_size=256, n_layer=4, ...)
+Total parameters: 917,608
+
+--- Forward pass (logits) ---
+Logits shape: (2, 64, 256) ✓
+
+--- Forward pass (loss) ---
+Loss: 5.544693  (expected ~5.55) ✓
+
+--- Gradient computation ---
+Got 32 gradient arrays ✓
+
+--- Naive generation ---
+Generated: [246, 168, 89, 67, 142, ...] (16 tokens) ✓
+
+All smoke tests passed! ✓
+```
+
+The loss being almost exactly $\ln(256) = 5.545$ tells us the model is correctly initialized — at the start, it assigns roughly equal probability to every token, which is exactly what you'd expect before any training.
+
+## What's next
+
+We have a GPT that can do a forward pass and generate (random) text. But it's slow — the naive `generate` function recomputes the entire sequence at every step. In the next post, we'll build a **KV cache** for efficient inference and wire up a tokenizer so we can talk to the model in actual English.
+
+After that: training. We'll implement the data pipeline and training loop, and watch this random babbler learn to speak.

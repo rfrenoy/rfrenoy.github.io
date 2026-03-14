@@ -1,0 +1,259 @@
+---
+title: "nanochat-mlx #3: Training with functional autodiff"
+date: "2026-03-13"
+description: "How to train a GPT in MLX — from the functional gradient pattern to learning rate schedules, gradient accumulation, and watching the loss drop."
+series: "nanochat-mlx"
+---
+
+import CodeCompare from '../../components/CodeCompare.astro';
+
+In the previous posts we built a GPT model ([post 1](/blog/01-gpt-model/)) and an efficient inference engine ([post 2](/blog/02-kv-cache-inference/)). But the model's weights are random — it produces gibberish. Time to fix that.
+
+Training a neural network means repeatedly:
+1. Feed data through the model (forward pass)
+2. Measure how wrong the predictions are (loss)
+3. Compute which direction to adjust each weight (gradients)
+4. Nudge the weights in that direction (optimizer step)
+
+The interesting part for this post is step 3 — computing gradients — because PyTorch and MLX do it in fundamentally different ways. This difference reshapes the entire training loop.
+
+## Two philosophies of automatic differentiation
+
+### PyTorch: the tape recorder
+
+PyTorch records every operation during the forward pass onto a **computation graph** (sometimes called a "tape"). When you call `loss.backward()`, it walks this graph in reverse, computing gradients for every parameter along the way. The gradients accumulate silently in `.grad` attributes on each parameter tensor.
+
+```python
+# PyTorch training step
+loss = model(x, y)          # 1. forward (records computation graph)
+loss.backward()              # 2. backward (walks graph, fills .grad)
+optimizer.step()             # 3. update params using .grad
+model.zero_grad()            # 4. clear .grad for next step
+```
+
+This is *imperative* — side effects everywhere. The graph is global state. Gradients live on tensors. You must remember to zero them.
+
+### MLX: the function transformer
+
+MLX takes a *functional* approach inspired by [JAX](https://github.com/google/jax). Instead of recording a tape, you **transform** your loss function into a new function that also returns gradients:
+
+```python
+# MLX training step
+def loss_fn(model, x, y):
+    return model(x, targets=y)
+
+loss_and_grad_fn = nn.value_and_grad(model, loss_fn)  # transform once
+
+loss, grads = loss_and_grad_fn(model, x, y)  # 1+2. forward + backward in one call
+optimizer.update(model, grads)                # 3. update params
+mx.eval(model.parameters(), optimizer.state)  # 4. force computation
+```
+
+There is no tape, no `.grad` attributes, no `zero_grad()`. The `grads` variable is a plain Python dict tree that mirrors the structure of `model.parameters()` — you can inspect it, average it, clip it, or throw it away. It's just data.
+
+### Why does this matter?
+
+The functional approach has three practical consequences:
+
+**No global state.** Gradients aren't hidden on parameter tensors — they're explicit return values. You always know where they are and what they contain.
+
+**No zero_grad footgun.** In PyTorch, forgetting `model.zero_grad()` means gradients from the previous step leak into the current one. MLX returns fresh gradients each call.
+
+**Lazy evaluation.** Nothing computes until `mx.eval(...)`. The entire forward-backward-update sequence is recorded as a computation graph and executed in one fused pass. This is MLX's performance trick: by seeing the whole pipeline at once, it can optimize memory allocation and kernel fusion across the forward and backward passes.
+
+## The training step in full
+
+Here's the complete side-by-side:
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`# Setup
+model = GPT(config)
+model.init_weights()
+model = torch.compile(model)
+optimizer = model.setup_optimizer(...)
+
+# Training step
+for micro_step in range(grad_accum_steps):
+    loss = model(x, y)
+    loss = loss / grad_accum_steps
+    loss.backward()
+    x, y, _ = next(train_loader)
+
+# Update LR manually per param group
+lrm = get_lr_multiplier(step)
+for group in optimizer.param_groups:
+    group["lr"] = group["initial_lr"] * lrm
+
+optimizer.step()
+model.zero_grad(set_to_none=True)`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`# Setup
+model = GPT(config)
+model.init_weights()
+mx.eval(model.parameters())
+lr_schedule = make_lr_schedule(...)
+optimizer = opt.AdamW(learning_rate=lr_schedule)
+
+# Training step
+loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+batches = [next(data_iter) for _ in range(grad_accum_steps)]
+loss, grads = accumulate_gradients(
+    loss_and_grad_fn, model, batches
+)
+optimizer.update(model, grads)
+mx.eval(model.parameters(), optimizer.state, loss)`}
+/>
+
+Let's unpack the differences.
+
+## Learning rate schedules
+
+nanochat uses a 3-phase learning rate schedule:
+
+1. **Linear warmup** from 0 to peak LR over 40 steps
+2. **Constant** at peak LR
+3. **Linear warmdown** to 5% of peak LR over the final 65% of training
+
+$$
+\eta(t) = \begin{cases}
+\eta_{\text{peak}} \cdot \frac{t}{T_{\text{warmup}}} & t < T_{\text{warmup}} \\
+\eta_{\text{peak}} & T_{\text{warmup}} \leq t \leq T - T_{\text{warmdown}} \\
+\eta_{\text{peak}} \cdot \left(\alpha + (1-\alpha)\frac{T - t}{T_{\text{warmdown}}}\right) & t > T - T_{\text{warmdown}}
+\end{cases}
+$$
+
+where $\alpha$ = `final_lr_frac` (typically 0.05).
+
+In PyTorch, nanochat implements this as a manual `get_lr_multiplier(step)` function and loops over `optimizer.param_groups` each step to set the LR. In MLX, we build the schedule declaratively using MLX's built-in primitives:
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch) — manual schedule"
+  leftCode={`def get_lr_multiplier(it):
+    if it < warmup_iters:
+        return (it + 1) / warmup_iters
+    elif it <= num_iterations - warmdown_iters:
+        return 1.0
+    else:
+        progress = (num_iterations - it) / warmdown_iters
+        return progress * 1.0 + (1 - progress) * final_lr_frac
+
+# Applied manually each step:
+lrm = get_lr_multiplier(step)
+for group in optimizer.param_groups:
+    group["lr"] = group["initial_lr"] * lrm`}
+  rightTitle="nanochat-mlx (MLX) — declarative schedule"
+  rightCode={`schedule = opt.join_schedules([
+    opt.linear_schedule(0.0, peak_lr, warmup_steps),
+    opt.linear_schedule(peak_lr, peak_lr, constant_steps),
+    opt.linear_schedule(peak_lr, final_lr, warmdown_steps),
+], boundaries=[warmup_steps, warmup_steps + constant_steps])
+
+# Pass to optimizer constructor — applied automatically:
+optimizer = opt.AdamW(learning_rate=schedule)`}
+/>
+
+MLX's `join_schedules` stitches multiple schedules together at specified boundaries. The optimizer calls the schedule internally on each `update()` call — no manual loop needed. The schedule is a callable that maps step count → learning rate, and the optimizer tracks its own step count.
+
+## Gradient accumulation: implicit vs. explicit
+
+When a single batch doesn't fit in memory (or when you want a larger effective batch size), you process multiple **micro-batches** and average their gradients before updating weights. This is called gradient accumulation.
+
+In PyTorch, it's almost invisible — `.backward()` *adds* to `.grad` by default:
+
+```python
+# PyTorch: gradients accumulate automatically
+for micro_step in range(4):
+    loss = model(x, y) / 4   # scale loss by 1/N
+    loss.backward()           # adds to .grad (doesn't overwrite!)
+optimizer.step()
+model.zero_grad()
+```
+
+In MLX, each `value_and_grad` call returns independent gradients. We have to sum them ourselves:
+
+```python
+def accumulate_gradients(loss_and_grad_fn, model, batches):
+    total_loss = mx.array(0.0)
+    total_grads = None
+
+    for x, y in batches:
+        loss, grads = loss_and_grad_fn(model, x, y)
+        total_loss = total_loss + loss
+        if total_grads is None:
+            total_grads = grads
+        else:
+            total_grads = tree_map(lambda a, b: a + b, total_grads, grads)
+
+    return total_loss / len(batches), tree_map(lambda g: g / len(batches), total_grads)
+```
+
+The `tree_map` function walks the nested gradient dict and applies a function to every leaf array — like a recursive `map` for trees. It's from `mlx.utils`, and it's one of the most commonly used utilities in functional ML frameworks.
+
+This is more explicit than PyTorch's implicit accumulation, but it has a nice property: you always see exactly what's happening to your gradients. No hidden state, no surprises.
+
+## The `mx.eval` question
+
+The most common mistake when starting with MLX is forgetting `mx.eval`. Let's understand why it matters.
+
+MLX is **lazy** — when you write `y = mx.matmul(a, b)`, no computation happens. MLX records the operation in a graph and returns a placeholder. Actual computation is deferred until someone calls `mx.eval(y)` or needs the concrete value (e.g., `y.item()`).
+
+In the training loop, this means the entire forward pass, backward pass, and optimizer update are recorded as one giant computation graph. Nothing runs until:
+
+```python
+mx.eval(model.parameters(), optimizer.state, loss)
+```
+
+This single `eval` call triggers everything — forward, backward, weight update — in one optimized pass. MLX can see the full picture and fuse operations, reuse memory buffers, and schedule GPU work efficiently.
+
+But if you forget it, computation piles up. After 100 steps without `eval`, you'd have 100 forward-backward graphs stacked in memory, and nothing would have actually computed. The program would appear fast (it's just recording, not computing!) and then crash with an out-of-memory error.
+
+The rule: **call `mx.eval` at least once per training step**, passing everything that needs to be materialized.
+
+## Does it learn?
+
+The moment of truth. We train a tiny model (depth=4, 256 dimensions, ~37M params) on a small text dataset:
+
+```
+$ python -m scripts.base_train --depth=4 --num-iterations=200 \
+    --batch-size=4 --max-seq-len=256 --data=text --learning-rate=1e-3
+
+Building model: depth=4, n_embd=256, n_head=4, seq_len=256
+Parameters: 36,700,264
+
+Expected initial loss: ~10.40 (-ln(1/32768))
+======================================================================
+step 00000 (  0.0%) | loss: 10.3970 | lr: 0.00e+00 | tok/s:  1,156
+step 00020 ( 10.0%) | loss:  3.8470 | lr: 1.00e-03 | tok/s:  6,514
+step 00060 ( 30.0%) | loss:  2.2829 | lr: 1.00e-03 | tok/s:  6,616
+step 00100 ( 50.0%) | loss:  1.8133 | lr: 7.81e-04 | tok/s:  6,829
+step 00140 ( 70.0%) | loss:  1.4242 | lr: 4.88e-04 | tok/s:  6,762
+step 00199 ( 99.5%) | loss:  0.9838 | lr: 5.73e-05 | tok/s:  6,700
+======================================================================
+Training complete!
+  Final loss (smoothed): 0.9838
+  Total time: 31.1s
+  Avg throughput: 6,580 tok/s
+```
+
+The loss drops from **10.40 to 0.98** — a 10× reduction. The initial loss of 10.40 = $\ln(32768)$ is exactly what you'd expect from a randomly initialized model predicting uniformly over a 32K vocabulary. By the end, the model has learned substantial structure from the text.
+
+To be clear: this is training on ~100K tokens of repeated literary quotes — it's memorization, not real language modeling. The model is learning to reproduce "To be or not to be" and "Call me Ishmael", not developing genuine language understanding. But it proves the training pipeline works: gradients flow, the optimizer updates weights, and the loss decreases.
+
+## What's still missing for real training
+
+This training loop works, but nanochat's full pipeline has several things we don't have yet:
+
+**The Muon optimizer.** nanochat doesn't use plain AdamW for everything. It uses [Muon](https://kellerjordan.github.io/posts/muon/) — an optimizer that orthogonalizes gradients using polar decomposition — for the 2D matrix parameters, and AdamW only for embeddings and scalar parameters. Muon converges significantly faster than AdamW for transformer training. That's Phase 5.
+
+**Real data.** Our tiny text dataset is 100K tokens of repeated sentences. nanochat trains on [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu-score-2) — billions of tokens of curated web text, fed through a sophisticated BOS-aligned best-fit dataloader. That's Phase 4.
+
+**Scaling laws.** nanochat auto-computes the optimal batch size, training horizon, learning rate, and weight decay from the model depth using scaling law relationships (Chinchilla ratios, Power Lines batch size scaling, $T_{\text{epoch}}$ framework for weight decay). We just hard-code hyperparameters for now.
+
+**Compilation.** nanochat wraps the model in `torch.compile(model, dynamic=False)` for a significant speedup. MLX has `mx.compile` which we haven't integrated yet.
+
+But the core training loop — functional gradient computation, LR scheduling, gradient accumulation, optimizer updates — is complete and tested. In the next post, we'll build the data pipeline to feed it real text.
+
+## What's next
+
+With the training loop working, the bottleneck is no longer the machinery — it's the data. In the next post, we'll build the data pipeline: downloading FineWeb-Edu, tokenizing it with a trained BPE tokenizer, and feeding it to the model in properly shuffled, BOS-aligned batches.

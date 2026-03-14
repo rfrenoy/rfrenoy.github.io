@@ -1,0 +1,197 @@
+---
+title: "nanochat-mlx #5: Muon — the optimizer that orthogonalizes your gradients"
+date: "2026-03-15"
+description: "Why AdamW isn't enough for fast transformer training, how Muon orthogonalizes gradients via polar decomposition, and how to port it to MLX."
+series: "nanochat-mlx"
+---
+
+import CodeCompare from '../../components/CodeCompare.astro';
+
+In [post 3](/blog/03-training-loop/), we built a working training loop with AdamW and watched it reduce loss on a small text dataset. But nanochat doesn't use AdamW alone — it uses **Muon** for the transformer's matrix parameters, and AdamW only for embeddings and scalar parameters. The result is dramatically faster convergence.
+
+How dramatic? On our toy training setup (200 steps, depth-4 model, ~100K tokens):
+
+| Optimizer | Final loss |
+|-----------|-----------|
+| AdamW | 1.43 |
+| MuonAdamW | **0.03** |
+
+Same model, same data, same number of steps. Muon reaches near-zero loss while AdamW is still struggling. Let's understand why.
+
+## What Muon does
+
+[Muon](https://kellerjordan.github.io/posts/muon/) — **M**oment**u**m **O**rthogonalized by **N**ewton-Schulz — is an optimizer designed specifically for matrix parameters. The core idea:
+
+1. Compute the gradient (same as any optimizer)
+2. Apply momentum (same as SGD with momentum)
+3. **Orthogonalize** the update via polar decomposition
+
+Step 3 is what makes Muon special. Instead of updating each weight independently (like AdamW), Muon replaces the gradient matrix $G$ with the nearest orthogonal matrix $U$, where $G = USV^T$ is the SVD.
+
+### Why orthogonalize?
+
+A gradient matrix $G \in \mathbb{R}^{M \times N}$ has singular values $\sigma_1 \geq \sigma_2 \geq \ldots \geq \sigma_{\min(M,N)}$. The problem: these singular values can vary by orders of magnitude. The largest singular values dominate the update, while the smallest directions get almost no gradient signal.
+
+Orthogonalization replaces all singular values with 1:
+
+$$G = U \text{diag}(\sigma_1, \sigma_2, \ldots) V^T \quad\longrightarrow\quad U \text{diag}(1, 1, \ldots) V^T = UV^T$$
+
+Every direction gets equal update magnitude. This is a much better-conditioned update for training neural networks, where we want all weight matrix directions to learn at roughly the same rate.
+
+Think of it as the matrix-valued analog of gradient normalization: just as dividing a vector gradient by its norm gives a unit-length update, replacing a matrix gradient with its polar factor gives an "equalized" update where no direction is preferred.
+
+## Polar Express: fast approximate orthogonalization
+
+Computing the exact SVD is $O(\min(M,N)^2 \cdot \max(M,N))$ — too expensive to run every training step. Muon originally used **Newton-Schulz iterations** to approximate the polar factor. nanochat has since switched to **Polar Express**, a newer iterative method with better convergence properties.
+
+The algorithm: given a matrix $X$, iterate 5 times:
+
+$$A = X X^T, \quad B = bA + cA^2, \quad X \leftarrow aX + BX$$
+
+where $(a, b, c)$ are pre-computed coefficients optimized for convergence. After 5 iterations, $X$ is approximately orthogonal ($XX^T \approx I$). The whole thing runs in **bfloat16** for speed.
+
+The result isn't exactly $UV^T$ — it's more like $US'V^T$ where the singular values $S'_{ii} \sim \text{Uniform}(0.5, 1.5)$. But this is close enough: the singular values are equalized to within a factor of 3, which empirically works just as well as exact orthogonalization.
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch) — Polar Express"
+  leftCode={`@torch.compile(dynamic=False, fullgraph=True)
+def polar_express(g, ns_steps):
+    X = g.bfloat16()
+    X /= X.norm(dim=(-2,-1), keepdim=True) * 1.01 + 1e-6
+
+    if g.size(-2) > g.size(-1):  # tall
+        for a, b, c in coeffs[:ns_steps]:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:                         # wide
+        for a, b, c in coeffs[:ns_steps]:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    return X`}
+  rightTitle="nanochat-mlx (MLX) — Polar Express"
+  rightCode={`def polar_express(G, ns_steps=5):
+    X = G.astype(mx.bfloat16)
+    X = X / (mx.linalg.norm(X, axis=(-2,-1),
+             keepdims=True) * 1.01 + 1e-6)
+
+    M, N = X.shape[-2], X.shape[-1]
+    if M > N:                     # tall
+        for a, b, c in COEFFS[:ns_steps]:
+            A = mx.swapaxes(X,-2,-1) @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:                         # wide
+        for a, b, c in COEFFS[:ns_steps]:
+            A = X @ mx.swapaxes(X,-2,-1)
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    return X.astype(mx.float32)`}
+/>
+
+Key differences:
+- PyTorch uses `@torch.compile` to fuse the iteration into a single kernel. MLX relies on lazy evaluation to achieve similar fusion.
+- PyTorch has `.mT` for the last-two-dims transpose; MLX uses `mx.swapaxes(X, -2, -1)`.
+- PyTorch does in-place division (`/=`); MLX arrays are immutable, so we reassign.
+
+## The full Muon pipeline
+
+Polar Express is just step 3 of 5 in a Muon optimizer step:
+
+1. **Nesterov momentum**: smooth the gradient using exponential moving average with Nesterov lookahead
+2. **Polar Express**: orthogonalize the smoothed gradient
+3. **NorMuon variance reduction**: normalize per-neuron update scales (the orthogonalized output can have non-uniform scales across neurons)
+4. **Cautious weight decay**: only decay weights where the gradient and parameter agree in sign
+5. **Parameter update**: apply the processed gradient
+
+In nanochat's PyTorch version, all 5 steps are fused into a single `@torch.compile` kernel that operates on **stacked** parameter tensors — all matrix params of the same shape are stacked into one big tensor for efficient batch processing.
+
+In our MLX version, we process parameters one at a time but rely on MLX's lazy evaluation to build one large computation graph that gets evaluated all at once:
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch) — fused stacked step"
+  leftCode={`@torch.compile(dynamic=False, fullgraph=True)
+def muon_step_fused(
+    stacked_grads,    # (12, 768, 3072)
+    stacked_params,   # (12, 768, 3072)
+    momentum_buffer,  # (12, 768, 3072)
+    second_momentum,  # (12, 768, 1)
+    momentum_t, lr_t, wd_t, beta2_t,
+    ns_steps, red_dim,
+):
+    # Nesterov momentum
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum_t)
+    g = stacked_grads.lerp_(momentum_buffer, momentum_t)
+    # Polar Express (in-place)
+    g = polar_express(g, ns_steps)
+    # NorMuon variance reduction
+    ...
+    # Cautious weight decay + update
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_(
+        lr * g + lr * wd * stacked_params * mask)`}
+  rightTitle="nanochat-mlx (MLX) — per-param functional"
+  rightCode={`def muon_step(grad, param, mom_buf, second_buf,
+              momentum, lr, wd, beta2, ns_steps):
+    M, N = grad.shape[-2], grad.shape[-1]
+    effective_lr = lr * max(1.0, M/N)**0.5
+
+    # Nesterov momentum
+    new_mom = momentum * mom_buf + (1-momentum) * grad
+    g = (1-momentum) * grad + momentum * new_mom
+    # Polar Express
+    g = polar_express(g, ns_steps)
+    # NorMuon variance reduction
+    ...
+    # Cautious weight decay + update
+    mask = (g * param) >= 0
+    new_param = param - effective_lr * g \\
+                - effective_lr * wd * param * mask
+    return new_param, new_mom, new_second`}
+/>
+
+## MuonAdamW: the combined optimizer
+
+Not all parameters should use Muon. Embeddings, the output head, and scalar parameters (like the residual stream lambdas) are better served by AdamW. nanochat groups parameters by type:
+
+| Parameter | Optimizer | Why |
+|-----------|-----------|-----|
+| Transformer matrices (Q, K, V, projections, MLP) | Muon | 2D matrices benefit from orthogonalized updates |
+| Token embeddings (`wte`) | AdamW | Embedding lookups aren't matrix multiplications |
+| Output head (`lm_head`) | AdamW | Tied to vocabulary size, different optimization dynamics |
+| Value embeddings | AdamW | Same as token embeddings |
+| `resid_lambdas`, `x0_lambdas` | AdamW | 1D scalars, Muon doesn't apply |
+
+Each group also gets its own learning rate, betas, and weight decay — carefully tuned hyperparameters from nanochat's scaling experiments.
+
+Our `MuonAdamW` class automatically classifies parameters by walking the model's parameter tree:
+
+```python
+optimizer = MuonAdamW(model, lr_schedule=schedule, matrix_lr=0.02, weight_decay=0.0)
+# ...
+loss, grads = loss_and_grad_fn(model, x, y)
+optimizer.step(model, grads)
+mx.eval(model.parameters())
+```
+
+## What we dropped
+
+nanochat's optimizer is heavily optimized for multi-GPU training:
+
+- **Stacked parameter processing**: groups all same-shape matrices into a single tensor for batch Polar Express
+- **`@torch.compile` fusion**: the entire momentum → orthogonalize → update pipeline compiles to a single CUDA kernel
+- **0-D CPU tensor trick**: hyperparameters passed as tensors to avoid recompilation when LR changes
+- **`DistMuonAdamW`**: distributed version with overlapped `reduce_scatter`/`all_gather` and ZeRO-2 style state sharding
+
+We don't need any of this:
+- No multi-GPU → no distributed communication
+- No `torch.compile` → MLX's lazy eval handles fusion
+- No 0-D tensor trick → no compilation to avoid
+- Processing params one at a time is fast enough on Apple Silicon for the model sizes we're targeting
+
+Our optimizer is ~250 lines vs nanochat's ~400. Same algorithm, simpler wrapper.
+
+## What's next
+
+With model, training loop, data pipeline, and optimizer all in place, we have everything needed to train a real model. The next step is evaluation — measuring model quality with bits-per-byte and the CORE metric, so we can compare our trained models against nanochat's benchmarks.

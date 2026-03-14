@@ -1,0 +1,138 @@
+---
+title: "nanochat-mlx #6: How do you know your model is any good?"
+date: "2026-03-16"
+description: "Why training loss isn't enough, how bits-per-byte normalizes across tokenizers, and building an evaluation pipeline in MLX."
+series: "nanochat-mlx"
+---
+
+import CodeCompare from '../../components/CodeCompare.astro';
+
+We've built a model, a training loop, a data pipeline, and a Muon optimizer. We've watched the loss go down. But "the loss went down" isn't a very satisfying answer to "is the model good?"
+
+The problem: loss values depend on the vocabulary size. A model with 32K tokens and a model with 100K tokens produce different loss numbers even if they're equally capable, because the baseline "random guessing" loss is $\ln(V)$ — higher for larger vocabularies.
+
+We need a metric that lets us compare models regardless of their tokenizer.
+
+## Bits per byte
+
+The standard solution is **bits per byte (bpb)** — the number of bits the model needs, on average, to encode one byte of text. This normalizes for tokenizer differences because:
+
+- **Nats per token** (the raw cross-entropy loss) depends on vocabulary size
+- **Nats per byte** = (nats per token) / (bytes per token), which cancels out the tokenizer
+- **Bits per byte** = nats per byte / ln(2), converting from natural log to base-2
+
+$$\text{bpb} = \frac{\sum_i \text{loss}_i}{\ln(2) \cdot \sum_i \text{bytes}_i}$$
+
+where loss$_i$ is the cross-entropy loss for predicting target token $i$, and bytes$_i$ is the UTF-8 byte length of that token.
+
+A model with 32K tokens that assigns "information" to a single token will have a higher per-token loss than a model with 100K tokens for that same word — but the 32K model's token represents more bytes, so the per-byte cost evens out.
+
+## Per-token loss: the key ingredient
+
+To compute bpb, we need per-token losses — not the averaged scalar we use during training. This means calling the model with `loss_reduction='none'`:
+
+<CodeCompare
+  leftTitle="nanochat (PyTorch)"
+  leftCode={`# Forward returns per-token loss
+loss2d = model(x, y, loss_reduction='none')
+# shape: (B, T)
+
+# Map targets to byte counts
+num_bytes = token_bytes[y.view(-1)]
+
+# Accumulate
+total_nats += (loss2d.view(-1) * (num_bytes > 0)).sum()
+total_bytes += num_bytes.sum()
+
+# All-reduce across GPUs
+dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
+dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
+
+bpb = total_nats.item() / (math.log(2) * total_bytes.item())`}
+  rightTitle="nanochat-mlx (MLX)"
+  rightCode={`# Forward returns per-token loss
+loss_2d = model(x, targets=y, loss_reduction='none')
+# shape: (B, T)
+
+# Map targets to byte counts
+num_bytes = token_bytes[y.reshape(-1)]
+
+# Accumulate
+counted = num_bytes > 0
+total_nats = total_nats + mx.sum(
+    loss_flat * counted.astype(loss_flat.dtype))
+total_bytes = total_bytes + mx.sum(num_bytes)
+
+# No all-reduce needed (single device)
+
+bpb = total_nats.item() / (math.log(2) * total_bytes.item())`}
+/>
+
+The `token_bytes` array is a lookup table: `token_bytes[i]` = number of UTF-8 bytes for token $i$. Special tokens (BOS, etc.) get 0 bytes so they don't affect the metric.
+
+We dropped the `dist.all_reduce` calls — no multi-GPU to sync across. That's 4 lines of code that disappear.
+
+## Handling special tokens
+
+Not all tokens should count toward bpb:
+
+- **BOS tokens** are structural markers, not text — they get 0 bytes
+- **Masked tokens** (target = -1, used in supervised fine-tuning) should be skipped
+- **Other special tokens** (user/assistant markers) are 0 bytes
+
+nanochat pre-computes the `token_bytes` tensor during tokenizer training and saves it to disk. We compute it on the fly:
+
+```python
+def compute_token_bytes(tokenizer) -> mx.array:
+    vocab_size = tokenizer.get_vocab_size()
+    special_tokens = tokenizer.get_special_tokens()
+    byte_counts = []
+    for token_id in range(vocab_size):
+        token_str = tokenizer.id_to_token(token_id)
+        if token_str in special_tokens:
+            byte_counts.append(0)
+        else:
+            byte_counts.append(len(token_str.encode("utf-8")))
+    return mx.array(byte_counts, dtype=mx.int32)
+```
+
+This is slower than loading a pre-saved tensor, but it only runs once and works with any tokenizer — including tiktoken's pretrained encodings.
+
+## Periodic evaluation during training
+
+The key design insight: **don't eval every step**. Computing bpb runs the model in inference mode over many batches without gradients. Doing this every step would double your training time.
+
+nanochat evaluates every N steps (typically every 10% of training). We can do the same by periodically calling `evaluate_bpb` with a frozen model:
+
+```python
+# Every eval_every steps:
+token_bytes = compute_token_bytes(tokenizer)
+val_loader = dataloader_bos_bestfit_simple(tokenizer, B, T, split="val")
+bpb = evaluate_bpb(model, val_loader, steps=eval_steps, token_bytes=token_bytes)
+print(f"val bpb: {bpb:.4f}")
+```
+
+The important subtlety: we evaluate on the **validation** split (the last parquet shard), not the training data. This measures generalization, not memorization.
+
+## What the numbers mean
+
+For reference, here are typical bpb values:
+
+| Model | Val bpb |
+|-------|---------|
+| Random (32K vocab) | ~15.0 |
+| GPT-2 124M | ~1.18 |
+| GPT-2 1.5B | ~0.97 |
+| State-of-the-art (2026) | ~0.7 |
+
+Lower is better. A bpb of 1.0 means the model needs 1 bit per byte of text — it's compressing text to 12.5% of its original size. Human-written English has about 1.0–1.5 bits per character of entropy, so models approaching 0.7 bpb are getting close to the theoretical limit for web text.
+
+## What about CORE?
+
+nanochat also evaluates the **CORE metric** — accuracy on a suite of multiple-choice knowledge benchmarks (ARC, MMLU, HellaSwag, etc.). This measures whether the model has learned *factual knowledge*, not just language statistics.
+
+We've deferred CORE for now. It requires downloading an eval bundle, rendering few-shot prompts with Jinja2 templates, and doing log-likelihood scoring — meaningful complexity that only pays off once you have a model trained on billions of tokens. For our current scale, bpb is the right metric.
+
+## What's next
+
+With evaluation in place, we can now run the full pipeline: download data, train with Muon, and measure bpb on validation. The remaining phases — supervised fine-tuning (Phase 7) and the chat UI (Phase 8) — turn our base model into a chatbot.
