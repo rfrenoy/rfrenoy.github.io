@@ -1,0 +1,39 @@
+---
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import { getCollection, render } from "astro:content";
+
+export async function getStaticPaths() {
+  const posts = await getCollection("daily-feed");
+  return posts.map((post) => ({
+    params: { id: post.id },
+    props: { post },
+  }));
+}
+
+const { post } = Astro.props;
+const { Content } = await render(post);
+---
+
+<BaseLayout
+  title={`${post.data.title} — Rémy Frenoy`}
+  currentPath="/daily-feed/"
+>
+  <article>
+    <div class="post-header">
+      <h1>{post.data.title}</h1>
+      <div class="post-meta">
+        <time>{post.data.date}</time>
+      </div>
+    </div>
+
+    <div class="callout">
+      <p>
+        This content is <strong>AI-generated</strong> by my
+        <a href="https://github.com/rfrenoy/rss-reader">RSS reader tool</a>.
+        Summaries and novelty ratings should be taken with a pinch of salt.
+      </p>
+    </div>
+
+    <Content />
+  </article>
+</BaseLayout>

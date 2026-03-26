@@ -1,0 +1,43 @@
+---
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import { getCollection } from "astro:content";
+
+const posts = (await getCollection("daily-feed")).sort(
+  (a, b) =>
+    new Date(b.data.date).getTime() - new Date(a.data.date).getTime(),
+);
+---
+
+<BaseLayout title="Rémy Frenoy — Daily Feed" currentPath="/daily-feed/">
+  <h2>Daily Feed</h2>
+
+  <div class="callout">
+    <p>
+      This section is <strong>AI-generated</strong>. Every day, an
+      <a href="https://github.com/rfrenoy/rss-reader">automated tool</a> fetches
+      articles from the RSS feeds I follow, summarizes them, and rates their
+      novelty. I use it to decide what to read each morning, think of it as my
+      public reading queue. Take the summaries and ratings with a pinch of salt.
+    </p>
+  </div>
+
+  {
+    posts.length > 0 ? (
+      <ul class="post-list">
+        {posts.map((post) => (
+          <li>
+            <h3>
+              <a href={`/daily-feed/${post.id}/`}>{post.data.title}</a>
+            </h3>
+            <span class="post-date">{post.data.date}</span>
+            {post.data.description && (
+              <p class="post-description">{post.data.description}</p>
+            )}
+          </li>
+        ))}
+      </ul>
+    ) : (
+      <p>No daily feeds yet — coming soon.</p>
+    )
+  }
+</BaseLayout>
