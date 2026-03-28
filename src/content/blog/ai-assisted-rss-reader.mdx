@@ -1,0 +1,35 @@
+---
+title: "RSS Reader with short summary and novelty score, using a local LLM"
+date: "2026-03-27"
+description: "Using local LLMs to prioritize the best articles to read"
+---
+
+[Source code on GitHub](https://github.com/rfrenoy/rss-reader)
+
+<mark>We only get 24 hours a day.</mark> That's a trivial statement, but we often underestimate how crucial this is. No matter how much money you get in the bank, no matter where you live, once you wake up you have more or less 16 hours before your day ends and you have to rest. When you are passionate about your craft, and curious about learning new things, you want to spend time reading new articles and ideas. But the time to do that fights against your work (though it can overlap on this one), your time with family and friends, hobbies, sports, etc.
+
+I often find myself frustrated I did not have the time to read some articles, or I end up going through less interesting ones and can't find the best until my time is up for the day.
+
+So I am always looking for ideas to improve the process of finding and sorting articles. I have a curated list of Reddit channels, X accounts, and interesting blogs I follow using a RSS reader.
+
+Recently, <mark>I wanted to try creating my own RSS reader</mark>. I wanted it to have basic RSS reader capabilities, so basically just extract daily the new articles from my feeds. But I also wanted it to <mark>help me pick the ones I wanted to spend time reading from end to end.</mark> I also wanted to try how well local LLMs perform outside of coding tasks. We know that, at the time I'm writing this, open source models are starting to get close to closed models on coding tasks, but these few open source models are heavy, and can't be run locally, at least without a costly infrastructure. But here I'm not trying to refactor a big codebase or implement a new feature, I basically want to summarize every new article to have some kind of *Too Long, Didn't Read* section, and a <mark>novelty score</mark> that would allow me to skip articles that are too close to what I already read.
+
+I'm currently using *Qwen2.5 7B* for summarization and *nomic-embed-text* for embeddings. Why embeddings? Because my first implementation of the novelty score relies on cosine similarity between the article and the set of articles in the DB. This way, an article about a topic I have already read dozens of articles on gets a lower score than something new. I'm using SQLite, which would make it easy to make this rss feed cross-platform by simply syncing the file.
+
+The 7B model handles summarization well for most articles, though it struggles with very long inputs. I mitigated this issue by placing the instruction after the article content rather than before it (small models tend to lose track of instructions when there's a wall of text between the prompt and where generation starts).
+
+Here is the full pipeline:
+1. **Fetch** all feeds and parse new articles (GUID-based deduplication)
+2. **Extract** full article content via Readability
+3. **Embed** each article for novelty scoring and deduplication
+4. **Deduplicate** articles too similar to existing ones (cosine similarity ≥ 85%)
+5. **Summarize** each article and generate tags via LLM
+6. **Output** a markdown digest sorted by novelty
+
+At the end of this pipeline, I am currently pushing the output file as a new entry to a [*daily feed* section on my blog](https://rfrenoy.github.io/daily-feed/), which makes it possible for me to read it on any platform.
+
+### What's next? 
+
+I think there are many possible ways to improve the novelty score, and I'll see as I keep using the daily feed how much I need to spend time on it. Other ideas are to extend the scope to tweets and other sources of information.
+
+Hope you like it! I'm always open to suggestions to improve this. Don't hesitate to create an issue or PR.
