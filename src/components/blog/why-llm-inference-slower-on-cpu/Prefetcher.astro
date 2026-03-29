@@ -1,0 +1,241 @@
+---
+/**
+ * Hardware prefetcher animation: shows how the prefetcher hides RAM latency
+ * by fetching future cache lines in the background while the CPU processes
+ * the current one. First access stalls, subsequent ones are served from L1.
+ */
+---
+
+<figure class="prefetcher-anim">
+  <svg viewBox="0 0 560 155" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Hardware prefetcher animation showing how cache line prefetching hides RAM latency">
+
+    <!-- Time axis -->
+    <line x1="75" y1="8" x2="530" y2="8" class="time-axis" />
+    <polygon points="528,5 528,11 536,8" class="time-arrow" />
+    <text x="540" y="11" class="time-label">time</text>
+
+    <!-- ─── CPU lane ─── -->
+    <text x="6" y="40" class="lane-label">CPU</text>
+    <text x="6" y="49" class="lane-label">core</text>
+
+    <!-- Step 1: STALL — cache miss on a[0] -->
+    <g class="step step-1">
+      <rect x="80" y="28" width="70" height="22" rx="3" class="stall-block" />
+      <text x="115" y="42" class="block-text stall-text">STALL ~100ns</text>
+      <text x="115" y="60" class="annotation bad">cache miss!</text>
+    </g>
+
+    <!-- Step 2: Process CL0 -->
+    <g class="step step-2">
+      <rect x="150" y="28" width="90" height="22" rx="3" class="compute-block" />
+      <text x="195" y="42" class="block-text">process a[0..15]</text>
+    </g>
+
+    <!-- Step 3: Process CL1 — no stall! -->
+    <g class="step step-3">
+      <rect x="240" y="28" width="90" height="22" rx="3" class="compute-block" />
+      <text x="285" y="42" class="block-text">process a[16..31]</text>
+      <text x="285" y="60" class="annotation good">cache hit!</text>
+    </g>
+
+    <!-- Step 4: Process CL2 — no stall! -->
+    <g class="step step-4">
+      <rect x="330" y="28" width="90" height="22" rx="3" class="compute-block" />
+      <text x="375" y="42" class="block-text">process a[32..47]</text>
+      <text x="375" y="60" class="annotation good">cache hit!</text>
+    </g>
+
+    <!-- ─── Prefetcher lane ─── -->
+    <text x="6" y="90" class="lane-label">HW</text>
+    <text x="6" y="99" class="lane-label">prefetcher</text>
+
+    <!-- Idle during first miss -->
+    <g class="step step-1">
+      <rect x="80" y="78" width="70" height="22" rx="3" class="idle-block" />
+      <text x="115" y="92" class="block-text idle-text">idle</text>
+    </g>
+
+    <!-- Step 2: Detects pattern, starts fetching CL1 -->
+    <g class="step step-2">
+      <rect x="150" y="78" width="30" height="22" rx="3" class="detect-block" />
+      <text x="165" y="86" class="tiny-text">detect</text>
+      <text x="165" y="95" class="tiny-text">pattern</text>
+      <rect x="180" y="78" width="65" height="22" rx="3" class="fetch-block" />
+      <text x="212" y="92" class="block-text fetch-text">fetch CL1</text>
+    </g>
+
+    <!-- Step 3: Fetch CL2 -->
+    <g class="step step-3">
+      <rect x="250" y="78" width="65" height="22" rx="3" class="fetch-block" />
+      <text x="282" y="92" class="block-text fetch-text">fetch CL2</text>
+    </g>
+
+    <!-- Step 4: Fetch CL3 -->
+    <g class="step step-4">
+      <rect x="340" y="78" width="65" height="22" rx="3" class="fetch-block" />
+      <text x="372" y="92" class="block-text fetch-text">fetch CL3</text>
+    </g>
+
+    <!-- ─── Connecting arrows: prefetch completes → data ready ─── -->
+    <g class="step step-3">
+      <line x1="240" y1="78" x2="240" y2="53" class="ready-arrow" />
+      <polygon points="237,55 243,55 240,50" class="ready-arrowhead" />
+    </g>
+    <g class="step step-4">
+      <line x1="330" y1="78" x2="330" y2="53" class="ready-arrow" />
+      <polygon points="327,55 333,55 330,50" class="ready-arrowhead" />
+    </g>
+
+    <!-- ─── Summary bar ─── -->
+    <text x="280" y="122" class="summary-label">Effective stall time</text>
+    <rect x="80" y="128" width="340" height="14" rx="3" class="bar-bg" />
+    <rect x="80" y="128" width="70" height="14" rx="3" class="bar-fill bar-stall step step-stall" />
+    <text x="250" y="139" class="bar-pct">Only the first access stalls — prefetcher hides the rest</text>
+
+  </svg>
+  <figcaption>The first access to <code>a[0]</code> misses the cache and stalls. The prefetcher detects the sequential pattern and fetches future cache lines from RAM <em>in the background</em>, while the CPU processes the current one. By the time the CPU needs <code>a[16]</code>, it is already in L1.</figcaption>
+</figure>
+
+<style>
+  .prefetcher-anim {
+    margin: 1.5rem 0;
+  }
+  .prefetcher-anim svg {
+    width: 100%;
+    max-width: 620px;
+    display: block;
+    margin: 0 auto;
+  }
+  .prefetcher-anim figcaption {
+    text-align: center;
+    font-size: 0.82rem;
+    color: #888;
+    margin-top: 0.5rem;
+  }
+
+  /* Time axis */
+  .time-axis {
+    stroke: #aaa;
+    stroke-width: 1.5;
+  }
+  .time-arrow {
+    fill: #aaa;
+  }
+  .time-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    fill: #aaa;
+    font-style: italic;
+  }
+
+  /* Lane labels */
+  .lane-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    fill: #888;
+    font-weight: 600;
+  }
+
+  /* Block styles */
+  .compute-block {
+    fill: #c8e6c9;
+    stroke: #4caf50;
+    stroke-width: 1;
+  }
+  .stall-block {
+    fill: #ffcdd2;
+    stroke: #e57373;
+    stroke-width: 1;
+    stroke-dasharray: 4 2;
+  }
+  .idle-block {
+    fill: #f5f5f5;
+    stroke: #ccc;
+    stroke-width: 1;
+    stroke-dasharray: 4 2;
+  }
+  .detect-block {
+    fill: #fff8e1;
+    stroke: #ffb74d;
+    stroke-width: 1;
+  }
+  .fetch-block {
+    fill: #dbe7fa;
+    stroke: #7da4d9;
+    stroke-width: 1;
+  }
+
+  /* Text styles */
+  .block-text {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 7px;
+    text-anchor: middle;
+    fill: #333;
+  }
+  .stall-text { fill: #c62828; }
+  .idle-text { fill: #999; }
+  .fetch-text { fill: #3a6ea5; }
+  .tiny-text {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 5.5px;
+    text-anchor: middle;
+    fill: #b07800;
+  }
+  .annotation {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 7px;
+    text-anchor: middle;
+    font-weight: 600;
+  }
+  .annotation.bad { fill: #c62828; }
+  .annotation.good { fill: #2e7d32; }
+
+  /* Connecting arrows */
+  .ready-arrow {
+    stroke: #4caf50;
+    stroke-width: 1.5;
+    stroke-dasharray: 4 2;
+  }
+  .ready-arrowhead {
+    fill: #4caf50;
+  }
+
+  /* Summary bar */
+  .summary-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 7.5px;
+    text-anchor: middle;
+    fill: #888;
+  }
+  .bar-bg {
+    fill: #e8f5e9;
+    stroke: #c8e6c9;
+    stroke-width: 1;
+  }
+  .bar-fill.bar-stall {
+    fill: #e57373;
+  }
+  .bar-pct {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 7px;
+    text-anchor: middle;
+    fill: #555;
+    font-weight: 600;
+  }
+
+  /* Step animations — each step fades in with a staggered delay */
+  .step {
+    opacity: 0;
+    animation: fade-in 0.5s ease-out forwards;
+  }
+  .step-1 { animation-delay: 0.2s; }
+  .step-2 { animation-delay: 1.0s; }
+  .step-3 { animation-delay: 1.8s; }
+  .step-4 { animation-delay: 2.6s; }
+  .step-stall { animation-delay: 3.2s; }
+
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+</style>

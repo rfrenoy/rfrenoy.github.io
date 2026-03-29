@@ -1,0 +1,116 @@
+---
+/**
+ * Animated architecture overview: CPU+RAM ↔ PCIe ↔ GPU+VRAM
+ * Shows data packets flowing across the PCIe bridge.
+ */
+---
+
+<figure class="arch-overview">
+  <svg viewBox="0 0 720 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture overview: CPU and RAM connected to GPU and VRAM via PCIe bus">
+    <!-- CPU + RAM side -->
+    <rect x="20" y="40" width="200" height="120" rx="10" class="box cpu-side" />
+    <text x="120" y="80" class="label">CPU</text>
+    <rect x="55" y="95" width="130" height="50" rx="6" class="box ram" />
+    <text x="120" y="125" class="sublabel">RAM</text>
+    <text x="120" y="142" class="detail">128-bit bus · ~100 GB/s</text>
+
+    <!-- GPU + VRAM side -->
+    <rect x="500" y="40" width="200" height="120" rx="10" class="box gpu-side" />
+    <text x="600" y="80" class="label">GPU</text>
+    <rect x="535" y="95" width="130" height="50" rx="6" class="box vram" />
+    <text x="600" y="125" class="sublabel">VRAM</text>
+    <text x="600" y="142" class="detail">384-bit bus · ~1 TB/s</text>
+
+    <!-- PCIe bridge -->
+    <rect x="280" y="80" width="160" height="40" rx="6" class="box pcie" />
+    <text x="360" y="102" class="sublabel pcie-label">PCIe 4.0</text>
+    <text x="360" y="114" class="detail">~32 GB/s</text>
+
+    <!-- Connections -->
+    <line x1="220" y1="100" x2="280" y2="100" class="conn" />
+    <line x1="440" y1="100" x2="500" y2="100" class="conn" />
+
+    <!-- Animated data packets (host → device) -->
+    <circle r="5" class="packet packet-h2d">
+      <animateMotion dur="2.5s" repeatCount="indefinite" keyPoints="0;1" keyTimes="0;1" calcMode="linear">
+        <mpath href="#path-h2d" />
+      </animateMotion>
+    </circle>
+    <circle r="5" class="packet packet-h2d" style="animation-delay: 1.25s">
+      <animateMotion dur="2.5s" repeatCount="indefinite" keyPoints="0;1" keyTimes="0;1" calcMode="linear" begin="1.25s">
+        <mpath href="#path-h2d" />
+      </animateMotion>
+    </circle>
+
+    <!-- Animated data packets (device → host) -->
+    <circle r="5" class="packet packet-d2h">
+      <animateMotion dur="2.5s" repeatCount="indefinite" keyPoints="0;1" keyTimes="0;1" calcMode="linear" begin="0.6s">
+        <mpath href="#path-d2h" />
+      </animateMotion>
+    </circle>
+
+    <!-- Motion paths -->
+    <path id="path-h2d" d="M 120 100 L 600 100" fill="none" stroke="none" />
+    <path id="path-d2h" d="M 600 100 L 120 100" fill="none" stroke="none" />
+  </svg>
+  <figcaption>Data must travel across the PCIe bridge between the two memory worlds. The packets animate the flow.</figcaption>
+</figure>
+
+<style>
+  .arch-overview {
+    margin: 1.5rem 0;
+  }
+  .arch-overview svg {
+    width: 100%;
+    max-width: 720px;
+    display: block;
+    margin: 0 auto;
+  }
+  .arch-overview figcaption {
+    text-align: center;
+    font-size: 0.82rem;
+    color: #888;
+    margin-top: 0.5rem;
+  }
+  .box {
+    fill: #f8f8f8;
+    stroke: #ccc;
+    stroke-width: 1.5;
+  }
+  .cpu-side { fill: #eef4ff; stroke: #9bb8e8; }
+  .ram { fill: #dbe7fa; stroke: #7da4d9; }
+  .gpu-side { fill: #f0ffe8; stroke: #8cc063; }
+  .vram { fill: #d9f0c8; stroke: #6ea84a; }
+  .pcie { fill: #fff3e0; stroke: #e6a23c; }
+  .label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 16px;
+    font-weight: 700;
+    text-anchor: middle;
+    fill: #333;
+  }
+  .sublabel {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 12px;
+    font-weight: 600;
+    text-anchor: middle;
+    fill: #555;
+  }
+  .detail {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 9px;
+    text-anchor: middle;
+    fill: #888;
+  }
+  .pcie-label { fill: #b37400; }
+  .conn {
+    stroke: #bbb;
+    stroke-width: 2;
+    stroke-dasharray: 6 4;
+  }
+  .packet {
+    opacity: 0.85;
+  }
+  .packet-h2d { fill: #4a9eff; }
+  .packet-d2h { fill: #6ea84a; }
+</style>

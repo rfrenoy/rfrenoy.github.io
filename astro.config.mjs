@@ -7,6 +7,7 @@ export default defineConfig({
   site: "https://rfrenoy.github.io",
   integrations: [mdx()],
   markdown: {
+    smartypants: false,
     remarkPlugins: [remarkMath],
     rehypePlugins: [rehypeKatex],
     shikiConfig: {

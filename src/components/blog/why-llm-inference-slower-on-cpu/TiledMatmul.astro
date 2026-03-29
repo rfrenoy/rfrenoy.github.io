@@ -1,0 +1,234 @@
+---
+/**
+ * Tiled matrix multiply animation.
+ * Side by side: naive (every thread reads from VRAM) vs tiled (cooperative load into shared memory).
+ */
+---
+
+<figure class="tiled-matmul">
+  <div class="tm-grid">
+    <!-- Naive -->
+    <div class="tm-col">
+      <div class="tm-title">Naive — every read from VRAM</div>
+      <svg viewBox="0 0 260 230" xmlns="http://www.w3.org/2000/svg">
+        <!-- Matrix A -->
+        <text x="50" y="14" class="mat-label">Matrix A</text>
+        {Array.from({ length: 4 }).map((_, r) =>
+          Array.from({ length: 4 }).map((_, c) => (
+            <rect x={10 + c * 22} y={20 + r * 22} width="20" height="20" rx="2"
+                  class={r === 1 ? "mat-cell hot-row" : "mat-cell"} />
+          ))
+        )}
+
+        <!-- Matrix B -->
+        <text x="190" y="14" class="mat-label">Matrix B</text>
+        {Array.from({ length: 4 }).map((_, r) =>
+          Array.from({ length: 4 }).map((_, c) => (
+            <rect x={150 + c * 22} y={20 + r * 22} width="20" height="20" rx="2"
+                  class={c === 2 ? "mat-cell hot-col" : "mat-cell"} />
+          ))
+        )}
+
+        <!-- Red arrows from A row and B column to VRAM -->
+        {Array.from({ length: 4 }).map((_, i) => (
+          <g>
+            <line x1={20 + i * 22} y1="108" x2={20 + i * 22} y2="145" class="vram-arrow" />
+            <line x1={170 + i * 22} y1="108" x2={170 + i * 22} y2="145" class="vram-arrow" />
+          </g>
+        ))}
+
+        <!-- VRAM bar -->
+        <rect x="5" y="150" width="250" height="24" rx="4" class="vram-bar" />
+        <text x="130" y="166" class="vram-label">VRAM (~400 cycles each read)</text>
+
+        <!-- Thread computing C[1][2] -->
+        <rect x="85" y="110" width="90" height="20" rx="4" class="thread-box" />
+        <text x="130" y="124" class="thread-label">Thread → C[1][2]</text>
+
+        <!-- Stats -->
+        <text x="130" y="195" class="stat bad">Each thread: 2N reads from VRAM</text>
+        <text x="130" y="210" class="stat bad">Total: 2N³ global memory reads</text>
+        <text x="130" y="225" class="stat bad">Massive redundancy</text>
+      </svg>
+    </div>
+
+    <!-- Tiled -->
+    <div class="tm-col">
+      <div class="tm-title">Tiled — cooperative shared memory load</div>
+      <svg viewBox="0 0 260 230" xmlns="http://www.w3.org/2000/svg">
+        <!-- Matrix A with tile highlighted -->
+        <text x="50" y="14" class="mat-label">Matrix A</text>
+        {Array.from({ length: 4 }).map((_, r) =>
+          Array.from({ length: 4 }).map((_, c) => (
+            <rect x={10 + c * 22} y={20 + r * 22} width="20" height="20" rx="2"
+                  class={(r >= 0 && r < 2 && c >= 0 && c < 2) ? "mat-cell tile-a" : "mat-cell dim"} />
+          ))
+        )}
+
+        <!-- Matrix B with tile highlighted -->
+        <text x="190" y="14" class="mat-label">Matrix B</text>
+        {Array.from({ length: 4 }).map((_, r) =>
+          Array.from({ length: 4 }).map((_, c) => (
+            <rect x={150 + c * 22} y={20 + r * 22} width="20" height="20" rx="2"
+                  class={(r >= 0 && r < 2 && c >= 2 && c < 4) ? "mat-cell tile-b" : "mat-cell dim"} />
+          ))
+        )}
+
+        <!-- Single arrow from each tile to shared memory -->
+        <line x1="50" y1="66" x2="50" y2="95" class="smem-arrow" />
+        <line x1="195" y1="66" x2="195" y2="95" class="smem-arrow" />
+        <text x="130" y="80" class="load-label">1 load per tile</text>
+
+        <!-- Shared memory blocks -->
+        <rect x="15" y="98" width="80" height="22" rx="4" class="smem-block" />
+        <text x="55" y="113" class="smem-label">As[TILE]</text>
+        <rect x="160" y="98" width="80" height="22" rx="4" class="smem-block" />
+        <text x="200" y="113" class="smem-label">Bs[TILE]</text>
+        <text x="130" y="113" class="smem-speed">~5 cycles</text>
+
+        <!-- All threads read from shared memory -->
+        {Array.from({ length: 4 }).map((_, i) => (
+          <g>
+            <line x1={30 + i * 18} y1="120" x2={30 + i * 18} y2="145" class="local-arrow" />
+            <line x1={173 + i * 18} y1="120" x2={173 + i * 18} y2="145" class="local-arrow" />
+          </g>
+        ))}
+
+        <rect x="30" y="148" width="200" height="22" rx="4" class="threads-bar" />
+        <text x="130" y="163" class="thread-label">All threads in block read shared mem</text>
+
+        <!-- Stats -->
+        <text x="130" y="195" class="stat good">VRAM reads: 2N³/TILE</text>
+        <text x="130" y="210" class="stat good">16× reduction with TILE=16</text>
+        <text x="130" y="225" class="stat good">Each element loaded once, shared by block</text>
+      </svg>
+    </div>
+  </div>
+  <figcaption>Left: every thread independently reads from slow VRAM. Right: threads cooperatively load a tile into fast shared memory, then all read from it. Dramatically fewer global memory accesses.</figcaption>
+</figure>
+
+<style>
+  .tiled-matmul {
+    margin: 1.5rem 0;
+  }
+  .tiled-matmul figcaption {
+    text-align: center;
+    font-size: 0.82rem;
+    color: #888;
+    margin-top: 0.5rem;
+  }
+  .tm-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+  @media (max-width: 600px) {
+    .tm-grid { grid-template-columns: 1fr; }
+  }
+  .tm-col svg {
+    width: 100%;
+    display: block;
+  }
+  .tm-title {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-align: center;
+    margin-bottom: 0.3rem;
+    color: #333;
+  }
+  .mat-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 9px;
+    font-weight: 600;
+    text-anchor: middle;
+    fill: #555;
+  }
+  .mat-cell {
+    fill: #f0f0f0;
+    stroke: #ccc;
+    stroke-width: 1;
+  }
+  .mat-cell.hot-row { fill: #ffcdd2; stroke: #e57373; }
+  .mat-cell.hot-col { fill: #ffcdd2; stroke: #e57373; }
+  .mat-cell.tile-a { fill: #c8e6c9; stroke: #4caf50; stroke-width: 1.5; }
+  .mat-cell.tile-b { fill: #bbdefb; stroke: #42a5f5; stroke-width: 1.5; }
+  .mat-cell.dim { fill: #f8f8f8; stroke: #e0e0e0; opacity: 0.5; }
+  .vram-arrow {
+    stroke: #e57373;
+    stroke-width: 1.5;
+    marker-end: url(#arrowRed);
+  }
+  .smem-arrow {
+    stroke: #4caf50;
+    stroke-width: 2;
+  }
+  .local-arrow {
+    stroke: #42a5f5;
+    stroke-width: 1;
+    opacity: 0.6;
+  }
+  .vram-bar {
+    fill: #fce4ec;
+    stroke: #ef5350;
+    stroke-width: 1.5;
+  }
+  .vram-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    text-anchor: middle;
+    fill: #c62828;
+    font-weight: 600;
+  }
+  .smem-block {
+    fill: #e3f2fd;
+    stroke: #42a5f5;
+    stroke-width: 1.5;
+  }
+  .smem-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    text-anchor: middle;
+    fill: #1565c0;
+    font-weight: 600;
+  }
+  .smem-speed {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    text-anchor: middle;
+    fill: #2e7d32;
+    font-weight: 600;
+  }
+  .load-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 7px;
+    text-anchor: middle;
+    fill: #4caf50;
+    font-weight: 600;
+  }
+  .thread-box {
+    fill: #eef4ff;
+    stroke: #7da4d9;
+    stroke-width: 1;
+  }
+  .threads-bar {
+    fill: #eef4ff;
+    stroke: #7da4d9;
+    stroke-width: 1;
+  }
+  .thread-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    text-anchor: middle;
+    fill: #4a6fa5;
+    font-weight: 600;
+  }
+  .stat {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8.5px;
+    text-anchor: middle;
+    font-weight: 600;
+  }
+  .stat.good { fill: #2e7d32; }
+  .stat.bad { fill: #c62828; }
+</style>

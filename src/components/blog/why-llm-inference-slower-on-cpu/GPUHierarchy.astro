@@ -1,0 +1,115 @@
+---
+/**
+ * GPU execution hierarchy: Grid → Blocks → Warps → Threads
+ * Animated zoom-in showing the structure.
+ */
+---
+
+<figure class="gpu-hierarchy">
+  <svg viewBox="0 0 680 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GPU thread hierarchy: Grid contains Blocks, which contain Warps of 32 Threads">
+    <!-- Grid -->
+    <rect x="10" y="10" width="660" height="220" rx="10" class="grid-box" />
+    <text x="340" y="30" class="level-label">Grid (all blocks for this kernel)</text>
+
+    <!-- Blocks -->
+    {Array.from({ length: 3 }).map((_, bi) => (
+      <g>
+        <rect x={25 + bi * 215} y="40" width="200" height="180" rx="8" class="block-box"
+              style={`animation-delay: ${0.2 + bi * 0.15}s`} />
+        <text x={125 + bi * 215} y="57" class="block-label">{`Block ${bi}`}</text>
+
+        {/* Warps within each block */}
+        {Array.from({ length: 3 }).map((_, wi) => (
+          <g>
+            <rect x={35 + bi * 215} y={65 + wi * 50} width="180" height="42" rx="5" class="warp-box"
+                  style={`animation-delay: ${0.5 + bi * 0.15 + wi * 0.1}s`} />
+            <text x={45 + bi * 215} y={78 + wi * 50} class="warp-label">{`Warp ${wi} (32 threads)`}</text>
+
+            {/* Threads within each warp */}
+            {Array.from({ length: 32 }).map((_, ti) => (
+              <rect x={38 + bi * 215 + ti * 5.4} y={83 + wi * 50} width="4" height="18" rx="1"
+                    class="thread-box"
+                    style={`animation-delay: ${0.8 + bi * 0.1 + wi * 0.08 + ti * 0.01}s`} />
+            ))}
+          </g>
+        ))}
+        <text x={125 + bi * 215} y="212" class="dots">⋯ more warps</text>
+      </g>
+    ))}
+  </svg>
+  <figcaption>A kernel launch creates a <strong>grid</strong> of <strong>blocks</strong>. Each block contains <strong>warps</strong> of 32 threads that execute in lockstep (SIMT). The GPU schedules warps across its streaming multiprocessors.</figcaption>
+</figure>
+
+<style>
+  .gpu-hierarchy {
+    margin: 1.5rem 0;
+  }
+  .gpu-hierarchy svg {
+    width: 100%;
+    max-width: 680px;
+    display: block;
+    margin: 0 auto;
+  }
+  .gpu-hierarchy figcaption {
+    text-align: center;
+    font-size: 0.82rem;
+    color: #888;
+    margin-top: 0.5rem;
+  }
+  .grid-box {
+    fill: #fafafa;
+    stroke: #bbb;
+    stroke-width: 2;
+    stroke-dasharray: 8 4;
+  }
+  .block-box {
+    fill: #f0ffe8;
+    stroke: #8cc063;
+    stroke-width: 1.5;
+    opacity: 0;
+    animation: fade-in 0.4s ease-out forwards;
+  }
+  .warp-box {
+    fill: #eef4ff;
+    stroke: #9bb8e8;
+    stroke-width: 1;
+    opacity: 0;
+    animation: fade-in 0.3s ease-out forwards;
+  }
+  .thread-box {
+    fill: #7da4d9;
+    stroke: none;
+    opacity: 0;
+    animation: fade-in 0.15s ease-out forwards;
+  }
+  .level-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px;
+    font-weight: 600;
+    text-anchor: middle;
+    fill: #888;
+  }
+  .block-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 10px;
+    font-weight: 600;
+    text-anchor: middle;
+    fill: #4a7c2e;
+  }
+  .warp-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 7.5px;
+    font-weight: 600;
+    fill: #4a6fa5;
+  }
+  .dots {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    text-anchor: middle;
+    fill: #aaa;
+  }
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+</style>

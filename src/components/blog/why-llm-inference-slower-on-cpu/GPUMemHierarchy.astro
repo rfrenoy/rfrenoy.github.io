@@ -1,0 +1,108 @@
+---
+/**
+ * GPU memory hierarchy: Registers → Shared Memory → L2 → VRAM
+ * Layered diagram with access times.
+ */
+---
+
+<figure class="gpu-mem-hier">
+  <svg viewBox="0 0 500 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GPU memory hierarchy from registers to VRAM">
+    <!-- Registers (innermost) -->
+    <rect x="175" y="10" width="150" height="36" rx="6" class="tier tier-reg" />
+    <text x="250" y="28" class="tier-label">Registers</text>
+    <text x="250" y="40" class="tier-detail">Per thread · ~1 cycle · 256 KB/SM</text>
+
+    <!-- Shared memory -->
+    <rect x="120" y="56" width="260" height="36" rx="6" class="tier tier-smem" />
+    <text x="250" y="74" class="tier-label">Shared Memory</text>
+    <text x="250" y="86" class="tier-detail">Per block · ~5 cycles · 48–100 KB/SM · programmer-managed</text>
+
+    <!-- L2 cache -->
+    <rect x="70" y="102" width="360" height="36" rx="6" class="tier tier-l2" />
+    <text x="250" y="120" class="tier-label">L2 Cache</text>
+    <text x="250" y="132" class="tier-detail">Global · ~200 cycles · 4–50 MB · hardware-managed</text>
+
+    <!-- VRAM -->
+    <rect x="20" y="148" width="460" height="36" rx="6" class="tier tier-vram" />
+    <text x="250" y="166" class="tier-label">VRAM (Global Memory)</text>
+    <text x="250" y="178" class="tier-detail">Global · ~400 cycles · 8–80 GB · ~1–3 TB/s</text>
+
+    <!-- Arrows showing speed gradient -->
+    <text x="500" y="30" class="speed-label fast">⚡ Fastest</text>
+    <text x="500" y="80" class="speed-label">&darr;</text>
+    <text x="500" y="130" class="speed-label">&darr;</text>
+    <text x="500" y="170" class="speed-label slow">🐢 Slowest</text>
+
+    <!-- Size gradient -->
+    <text x="0" y="30" class="size-label small">Smallest</text>
+    <text x="0" y="80" class="size-label">&darr;</text>
+    <text x="0" y="130" class="size-label">&darr;</text>
+    <text x="0" y="170" class="size-label big">Largest</text>
+
+    <!-- Key insight callout -->
+    <rect x="85" y="194" width="330" height="22" rx="4" class="callout-box" />
+    <text x="250" y="209" class="callout-text">Shared memory = programmable L1 cache (you manage it)</text>
+  </svg>
+  <figcaption>The GPU memory hierarchy mirrors the CPU's — keep hot data close to compute. The key difference: <strong>shared memory</strong> is explicitly managed by the programmer, unlike CPU caches.</figcaption>
+</figure>
+
+<style>
+  .gpu-mem-hier {
+    margin: 1.5rem 0;
+  }
+  .gpu-mem-hier svg {
+    width: 100%;
+    max-width: 500px;
+    display: block;
+    margin: 0 auto;
+  }
+  .gpu-mem-hier figcaption {
+    text-align: center;
+    font-size: 0.82rem;
+    color: #888;
+    margin-top: 0.5rem;
+  }
+  .tier {
+    stroke-width: 1.5;
+  }
+  .tier-reg { fill: #e8f5e9; stroke: #66bb6a; }
+  .tier-smem { fill: #e3f2fd; stroke: #42a5f5; }
+  .tier-l2 { fill: #fff8e1; stroke: #ffca28; }
+  .tier-vram { fill: #fce4ec; stroke: #ef5350; }
+  .tier-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px;
+    font-weight: 700;
+    text-anchor: middle;
+    fill: #333;
+  }
+  .tier-detail {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 7.5px;
+    text-anchor: middle;
+    fill: #777;
+  }
+  .speed-label, .size-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    fill: #aaa;
+  }
+  .speed-label { text-anchor: start; }
+  .size-label { text-anchor: end; }
+  .speed-label.fast { fill: #2e7d32; }
+  .speed-label.slow { fill: #c62828; }
+  .size-label.small { fill: #888; }
+  .size-label.big { fill: #888; }
+  .callout-box {
+    fill: #f3e5f5;
+    stroke: #ba68c8;
+    stroke-width: 1.5;
+  }
+  .callout-text {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 9px;
+    font-weight: 600;
+    text-anchor: middle;
+    fill: #7b1fa2;
+  }
+</style>

@@ -1,0 +1,184 @@
+---
+/**
+ * SIMD lanes animation: scalar (1 element) vs NEON (4 elements per instruction).
+ */
+const aVals = [3.0, 3.1, 3.2, 3.3];
+const bVals = [2.0, 2.1, 2.2, 2.3];
+const cVals = [5.0, 5.2, 5.4, 5.6];
+---
+
+<figure class="simd-lanes">
+  <div class="simd-grid">
+    <!-- Scalar -->
+    <div class="simd-col">
+      <div class="simd-title">Scalar (1 float / instruction)</div>
+      <svg viewBox="0 0 260 150" xmlns="http://www.w3.org/2000/svg">
+        <!-- Input a -->
+        <text x="40" y="14" class="reg-label">a[i]</text>
+        <rect x="15" y="20" width="50" height="24" rx="3" class="reg scalar-a" />
+        <text x="40" y="36" class="val">3.0</text>
+
+        <!-- Input b -->
+        <text x="100" y="14" class="reg-label">b[i]</text>
+        <rect x="75" y="20" width="50" height="24" rx="3" class="reg scalar-b" />
+        <text x="100" y="36" class="val">2.0</text>
+
+        <!-- ADD -->
+        <rect x="40" y="60" width="60" height="24" rx="4" class="alu" />
+        <text x="70" y="76" class="alu-label">ADD</text>
+
+        <!-- Arrows -->
+        <line x1="40" y1="44" x2="60" y2="60" class="wire" />
+        <line x1="100" y1="44" x2="80" y2="60" class="wire" />
+        <line x1="70" y1="84" x2="70" y2="100" class="wire" />
+
+        <!-- Output -->
+        <rect x="45" y="102" width="50" height="24" rx="3" class="reg result" />
+        <text x="70" y="118" class="val">5.0</text>
+        <text x="70" y="142" class="throughput">1 result / instruction</text>
+      </svg>
+    </div>
+
+    <!-- NEON -->
+    <div class="simd-col">
+      <div class="simd-title">NEON (4 floats / instruction)</div>
+      <svg viewBox="0 0 220 150" xmlns="http://www.w3.org/2000/svg">
+        <!-- Input a: 4 lanes -->
+        <text x="110" y="8" class="reg-label">{"float32x4_t va = {a[0]..a[3]}"}</text>
+        {aVals.map((v, i) => (
+          <g>
+            <rect x={10 + i * 50} y="14" width="48" height="22" rx="2"
+                  class="reg lane-a"
+                  style={`animation-delay: ${i * 0.08}s`} />
+            <text x={34 + i * 50} y="29" class="lane-val">{v.toFixed(1)}</text>
+          </g>
+        ))}
+
+        <!-- Input b: 4 lanes -->
+        {bVals.map((v, i) => (
+          <g>
+            <rect x={10 + i * 50} y="42" width="48" height="22" rx="2"
+                  class="reg lane-b"
+                  style={`animation-delay: ${i * 0.08}s`} />
+            <text x={34 + i * 50} y="57" class="lane-val">{v.toFixed(1)}</text>
+          </g>
+        ))}
+
+        <!-- ALU: 4 parallel ADDs -->
+        {Array.from({ length: 4 }).map((_, i) => (
+          <g>
+            <rect x={10 + i * 50} y="74" width="48" height="18" rx="3"
+                  class="alu"
+                  style={`animation-delay: ${0.5 + i * 0.05}s`} />
+            <text x={34 + i * 50} y="86" class="alu-label-lane">ADD</text>
+          </g>
+        ))}
+
+        <!-- Output: 4 results -->
+        {cVals.map((v, i) => (
+          <g>
+            <rect x={10 + i * 50} y="102" width="48" height="22" rx="2"
+                  class="reg lane-result"
+                  style={`animation-delay: ${0.8 + i * 0.08}s`} />
+            <text x={34 + i * 50} y="117" class="lane-val">{v.toFixed(1)}</text>
+          </g>
+        ))}
+
+        <text x="110" y="142" class="throughput highlight">{"4 results / instruction \u2192 4\u00d7 throughput"}</text>
+      </svg>
+    </div>
+  </div>
+  <figcaption>One NEON <code>vaddq_f32</code> does the same work as 4 scalar additions, using 4 parallel lanes in a 128-bit register.</figcaption>
+</figure>
+
+<style>
+  .simd-lanes {
+    margin: 1.5rem 0;
+  }
+  .simd-lanes figcaption {
+    text-align: center;
+    font-size: 0.82rem;
+    color: #888;
+    margin-top: 0.5rem;
+  }
+  .simd-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    align-items: start;
+  }
+  @media (max-width: 600px) {
+    .simd-grid { grid-template-columns: 1fr; }
+  }
+  .simd-col svg {
+    width: 100%;
+    display: block;
+  }
+  .simd-title {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.82rem;
+    font-weight: 600;
+    text-align: center;
+    margin-bottom: 0.3rem;
+    color: #333;
+  }
+  .reg {
+    stroke-width: 1;
+  }
+  .scalar-a, .lane-a { fill: #dbe7fa; stroke: #7da4d9; }
+  .scalar-b, .lane-b { fill: #e8f5e9; stroke: #81c784; }
+  .result, .lane-result { fill: #fff3e0; stroke: #ffb74d; }
+  .alu {
+    fill: #f3e5f5;
+    stroke: #ba68c8;
+    stroke-width: 1.5;
+  }
+  .reg-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    text-anchor: middle;
+    fill: #888;
+  }
+  .val {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 10px;
+    text-anchor: middle;
+    fill: #333;
+    font-weight: 600;
+  }
+  .lane-val {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    text-anchor: middle;
+    fill: #333;
+    font-weight: 600;
+  }
+  .alu-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 10px;
+    text-anchor: middle;
+    fill: #7b1fa2;
+    font-weight: 700;
+  }
+  .alu-label-lane {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    text-anchor: middle;
+    fill: #7b1fa2;
+    font-weight: 700;
+  }
+  .wire {
+    stroke: #aaa;
+    stroke-width: 1;
+  }
+  .throughput {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8.5px;
+    text-anchor: middle;
+    fill: #555;
+    font-weight: 600;
+  }
+  .throughput.highlight {
+    fill: #2e7d32;
+  }
+</style>

@@ -1,0 +1,148 @@
+---
+/**
+ * Sequential vs strided memory access animation.
+ * Shows cache line utilization for both patterns.
+ */
+---
+
+<figure class="access-pattern">
+  <div class="pattern-grid">
+    <!-- Sequential access -->
+    <div class="pattern-col">
+      <div class="pattern-title">Sequential access</div>
+      <svg viewBox="0 0 280 140" xmlns="http://www.w3.org/2000/svg">
+        <text x="140" y="14" class="pat-label">Cache line (64 bytes = 16 floats)</text>
+        {Array.from({ length: 16 }).map((_, i) => (
+          <rect x={10 + i * 16.25} y="22" width="14.5" height="22" rx="2"
+                class="cell used"
+                style={`animation-delay: ${i * 0.12}s`} />
+        ))}
+        {Array.from({ length: 16 }).map((_, i) => (
+          <text x={17.25 + i * 16.25} y="37" class="idx">{i}</text>
+        ))}
+        <text x="140" y="64" class="stat good">16/16 floats used → 100% utilization</text>
+        <rect x="30" y="75" width="220" height="16" rx="3" class="bar-bg" />
+        <rect x="30" y="75" width="220" height="16" rx="3" class="bar-fill bar-good" />
+        <text x="140" y="87" class="bar-text">~80 GB/s effective</text>
+
+        <text x="140" y="118" class="stat">✅ Prefetcher active</text>
+        <text x="140" y="132" class="stat">Every byte from RAM is used</text>
+      </svg>
+    </div>
+
+    <!-- Strided access -->
+    <div class="pattern-col">
+      <div class="pattern-title">Stride-16 access</div>
+      <svg viewBox="0 0 280 140" xmlns="http://www.w3.org/2000/svg">
+        <text x="140" y="14" class="pat-label">Cache line (64 bytes = 16 floats)</text>
+        {Array.from({ length: 16 }).map((_, i) => (
+          <rect x={10 + i * 16.25} y="22" width="14.5" height="22" rx="2"
+                class={i === 0 ? "cell used" : "cell wasted"}
+                style={`animation-delay: ${i * 0.12}s`} />
+        ))}
+        {Array.from({ length: 16 }).map((_, i) => (
+          <text x={17.25 + i * 16.25} y="37" class="idx">{i}</text>
+        ))}
+        <text x="140" y="64" class="stat bad">1/16 floats used → 6.25% utilization</text>
+        <rect x="30" y="75" width="220" height="16" rx="3" class="bar-bg" />
+        <rect x="30" y="75" width="13.75" height="16" rx="3" class="bar-fill bar-bad" />
+        <text x="140" y="87" class="bar-text">~5 GB/s effective</text>
+
+        <text x="140" y="118" class="stat">❌ Prefetcher defeated</text>
+        <text x="140" y="132" class="stat">93.75% of fetched bytes wasted</text>
+      </svg>
+    </div>
+  </div>
+  <figcaption>Same RAM, same hardware — only the access pattern changes. Sequential access uses the full cache line; stride-16 wastes almost everything.</figcaption>
+</figure>
+
+<style>
+  .access-pattern {
+    margin: 1.5rem 0;
+  }
+  .access-pattern figcaption {
+    text-align: center;
+    font-size: 0.82rem;
+    color: #888;
+    margin-top: 0.5rem;
+  }
+  .pattern-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+  @media (max-width: 600px) {
+    .pattern-grid { grid-template-columns: 1fr; }
+  }
+  .pattern-col svg {
+    width: 100%;
+    display: block;
+  }
+  .pattern-title {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.82rem;
+    font-weight: 600;
+    text-align: center;
+    margin-bottom: 0.3rem;
+    color: #333;
+  }
+  .pat-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    text-anchor: middle;
+    fill: #888;
+  }
+  .cell {
+    stroke-width: 1;
+    opacity: 0;
+    animation: fade-in 0.3s ease-out forwards;
+  }
+  .cell.used {
+    fill: #c8e6c9;
+    stroke: #4caf50;
+  }
+  .cell.wasted {
+    fill: #ffcdd2;
+    stroke: #e57373;
+  }
+  .idx {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 6px;
+    text-anchor: middle;
+    fill: #666;
+  }
+  .stat {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8.5px;
+    text-anchor: middle;
+    fill: #555;
+  }
+  .stat.good { fill: #2e7d32; font-weight: 600; }
+  .stat.bad { fill: #c62828; font-weight: 600; }
+  .bar-bg {
+    fill: #eee;
+    stroke: #ddd;
+    stroke-width: 1;
+  }
+  .bar-fill {
+    stroke: none;
+    animation: grow-bar 1s ease-out 0.5s both;
+    transform-origin: left;
+  }
+  .bar-good { fill: #81c784; }
+  .bar-bad { fill: #e57373; }
+  .bar-text {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    text-anchor: middle;
+    fill: #444;
+    font-weight: 600;
+  }
+  @keyframes fade-in {
+    to { opacity: 1; }
+  }
+  @keyframes grow-bar {
+    from { transform: scaleX(0); }
+    to { transform: scaleX(1); }
+  }
+</style>

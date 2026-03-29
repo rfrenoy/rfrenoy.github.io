@@ -1,0 +1,642 @@
+---
+title: "Why Is LLM Inference So Much Slower on CPU? A Deep Dive"
+date: "2026-03-28"
+description: "GPU inference is ~10–20x faster than CPU, and it's not about compute. A complete walkthrough of how CPUs and GPUs access memory differently, from cache lines to coalesced access, SIMD to SIMT, and shared memory tiling."
+---
+
+import ArchOverview from '../../components/blog/why-llm-inference-slower-on-cpu/ArchOverview.astro';
+import CacheLine from '../../components/blog/why-llm-inference-slower-on-cpu/CacheLine.astro';
+import AccessPattern from '../../components/blog/why-llm-inference-slower-on-cpu/AccessPattern.astro';
+import SoAvsAoS from '../../components/blog/why-llm-inference-slower-on-cpu/SoAvsAoS.astro';
+import SIMDLanes from '../../components/blog/why-llm-inference-slower-on-cpu/SIMDLanes.astro';
+import GPUHierarchy from '../../components/blog/why-llm-inference-slower-on-cpu/GPUHierarchy.astro';
+import CoalescedAccess from '../../components/blog/why-llm-inference-slower-on-cpu/CoalescedAccess.astro';
+import LatencyHiding from '../../components/blog/why-llm-inference-slower-on-cpu/LatencyHiding.astro';
+import GPUMemHierarchy from '../../components/blog/why-llm-inference-slower-on-cpu/GPUMemHierarchy.astro';
+import TiledMatmul from '../../components/blog/why-llm-inference-slower-on-cpu/TiledMatmul.astro';
+import FullJourney from '../../components/blog/why-llm-inference-slower-on-cpu/FullJourney.astro';
+import LLMInference from '../../components/blog/why-llm-inference-slower-on-cpu/LLMInference.astro';
+import Prefetcher from '../../components/blog/why-llm-inference-slower-on-cpu/Prefetcher.astro';
+import CodeCompare from '../../components/CodeCompare.astro';
+
+Researchers and engineers have known for a long time that training models on a GPU is much faster than on a CPU. But a wider range of the population has recently seen the difference in performances between CPUs and GPUs when trying to run LLMs locally. So why are GPUs so much faster? They are not faster on all tasks, and the easy answer we often hear is that they *parallelize* more. Which is true, but a bit simplistic. So I wanted to dig deeper on this topic, and this article is the result of this deep dive.
+
+We will do a complete walkthrough of how data actually moves through a CPU+RAM system versus a GPU+VRAM system. We'll start from the basics (cache lines, SIMD, GPU warps), build up through shared memory tiling, and arrive at the full picture of why streaming 14 GB of model weights through a GPU's wide memory bus is so much faster than through a CPU's narrow one.
+
+I hope that you'll find it interesting.
+
+---
+
+## Part 1: The Two Worlds
+
+CPUs and GPUs solve different problems, and their memory systems reflect that. They take different positions on the <mark>latency vs throughput trade-off</mark>, a trade-off you see on many pieces of computer infrastructure.
+
+A <mark>**CPU** is optimized for **latency**</mark>. CPUs have to complete huge amounts of often very small and different tasks, so we expect it to be very efficient. It has a small number of powerful cores (8–24 on a typical desktop). The goal is to make *one thread* go as fast as possible. When a CPU core requests data from RAM, it needs it *now*. A cache miss that takes 100 nanoseconds means the core is sitting idle for hundreds of cycles.
+
+<mark>A **GPU** is optimized for **throughput**</mark>. GPU works on fewer amounts of big tasks, so a little overhead per task is not a big deal if it means the big task can be run fast. It has thousands of small cores (e.g. 16,384 on an RTX 4090<sup>[2]</sup>) designed to run the same instruction across many data elements simultaneously. No single thread is fast, but the aggregate work done per second is huge. When a GPU thread requests data from VRAM, it doesn't need it now. It can wait, because the GPU will switch to other threads in the meantime.
+
+These different philosophies lead to different memory designs:
+
+| | CPU + RAM | GPU + VRAM |
+|---|---|---|
+| **Optimize for** | Low latency (fast single access) | High throughput (many accesses in flight) |
+| **Bus width** | Narrow: 64–128 bit | Wide: 256–5120 bit |
+| **Bandwidth** | ~100 GB/s (Apple M2, LPDDR5)<sup>[1]</sup> | ~1 TB/s (GDDR6X)<sup>[2]</sup> to ~3 TB/s (HBM3)<sup>[4]</sup> |
+| **Latency strategy** | Reduce it (caches, prefetching) | Hide it (thread switching) |
+| **Capacity** | 16–128 GB typical | 8–80 GB typical |
+
+And they're connected by a **PCIe bus**, a comparatively narrow bridge (~32 GB/s for PCIe 4.0 x16)<sup>[3]</sup> that becomes the bottleneck whenever data must travel between the two worlds.
+
+<ArchOverview />
+
+With that context, let's look at each side in detail.
+
+---
+
+## Part 2: The CPU + RAM Side
+
+### 2.1 A simple loop
+
+Let's start with the most basic operation: adding two arrays element by element.
+
+```c
+// vector_add.c - scalar CPU version
+void vector_add(float* a, float* b, float* c, int n) {
+    for (int i = 0; i < n; i++) {
+        c[i] = a[i] + b[i];
+    }
+}
+```
+
+But what actually happens when the CPU executes `a[i]`?
+
+The CPU doesn't talk to RAM directly. It goes through a **cache hierarchy**:
+
+1. **L1 cache** (~32 KB, ~1 ns): tiny, per-core, very very fast
+2. **L2 cache** (~256 KB–1 MB, ~5 ns): per-core, still very fast
+3. **L3 cache** (~8–32 MB, ~20 ns): shared across cores, 20x slower than L1
+4. **RAM** (~64+ GB, ~100 ns): the main memory, 100x slower than L1
+
+When the CPU needs `a[0]`, it checks L1 first. On a miss, it checks L2, then L3, then finally goes to RAM. And when it does fetch from RAM, it doesn't fetch just 4 bytes (one `float`). It fetches an entire **cache line**: <mark>64 bytes</mark>, which corresponds to 16 floats at once.
+
+<CacheLine />
+
+This is where CPU memory optimization happens: <mark>spatial locality</mark>. If you access `a[0]`, the hardware bets that you'll access `a[1]` through `a[15]` soon. For a sequential loop, that bet pays off: one RAM access serves 16 iterations.
+
+### 2.2 Sequential vs strided access
+
+*[See benchmark](https://github.com/rfrenoy/cpu-memory-optimization-examples/blob/main/sequential_vs_strided.c)*
+
+What happens when the bet *doesn't* pay off? Consider these two loops:
+
+```c
+// Sequential: accesses a[0], a[1], a[2], ... - cache-friendly
+float sum = 0;
+for (int i = 0; i < n; i++) {
+    sum += a[i];
+}
+
+// Strided: accesses a[0], a[64], a[128], ... - cache-hostile
+float sum = 0;
+for (int i = 0; i < n; i += 16) {
+    sum += a[i];
+}
+```
+
+In the sequential version, every cache line fetch is fully utilized: all 16 floats get read. In the strided version, we fetch 64 bytes from RAM but only use 4 bytes, meaning <mark>93.75% of the bandwidth is wasted</mark>.
+
+On real hardware, the difference is huge. For a large array that doesn't fit in cache:
+
+| Access pattern | Effective bandwidth | Utilization |
+|---|---|---|
+| Sequential | ~80 GB/s | ~100% |
+| Stride-16 (every 64th byte) | ~5 GB/s | ~6% |
+
+So with the exact same hardware, just changing the way we walk through memory impact bandwidth by a factor of 16.
+
+<AccessPattern />
+
+The CPU also has a <mark>hardware prefetcher</mark>: it detects sequential access patterns and starts fetching future cache lines before you need them. This means sequential access can effectively *hide* RAM latency: the data is already in L1 by the time the loop gets to it. Strided or random access defeats the prefetcher, and every access stalls.
+
+<Prefetcher />
+
+### 2.3 Structure of Arrays vs Array of Structures
+
+*[See benchmark](https://github.com/rfrenoy/cpu-memory-optimization-examples/blob/main/aos_vs_soa.c)*
+
+This cache line principle has direct implications for how you lay out data. Let's take the implementation of a particle system as a toy example:
+
+```c
+// Array of Structures (AoS) - the "natural" layout
+struct Particle {
+    float x, y, z;       // position
+    float vx, vy, vz;    // velocity
+    float mass;
+    float charge;         // 32 bytes total
+};
+struct Particle particles[1000000];
+
+// To update positions:
+for (int i = 0; i < n; i++) {
+    particles[i].x += particles[i].vx * dt;
+    particles[i].y += particles[i].vy * dt;
+    particles[i].z += particles[i].vz * dt;
+}
+```
+
+```c
+// Structure of Arrays (SoA) - the cache-friendly layout
+struct Particles {
+    float x[1000000], y[1000000], z[1000000];
+    float vx[1000000], vy[1000000], vz[1000000];
+    float mass[1000000];
+    float charge[1000000];
+};
+struct Particles p;
+
+// To update positions:
+for (int i = 0; i < n; i++) {
+    p.x[i] += p.vx[i] * dt;
+    p.y[i] += p.vy[i] * dt;
+    p.z[i] += p.vz[i] * dt;
+}
+```
+
+With AoS, each cache line (64 bytes) holds <mark>2 complete particles</mark>, including `mass` and `charge` that we don't need for position updates, so we load data we never use.
+
+With SoA, a cache line holds <mark>16 consecutive `x` values</mark>, and we use every single one. When the loop processes `x` values, the data stream is perfectly sequential and the prefetcher is happy.
+
+<SoAvsAoS />
+
+In real-world code, switching from AoS to SoA often gives a <mark>2–4x speedup</mark> for data-parallel workloads. Game engines, physics simulations, and database systems all use SoA layouts for hot paths.
+
+---
+
+## Part 3: CPU SIMD: Doing More Per Clock
+
+### 3.1 From scalar to SIMD
+
+*[See benchmark](https://github.com/rfrenoy/cpu-memory-optimization-examples/blob/main/scalar_vs_simd.c)*
+
+So far, our CPU is processing one float at a time. But modern CPUs have **SIMD** (Single Instruction, Multiple Data) registers that can hold and operate on multiple values simultaneously:
+
+| SIMD generation | Architecture | Register width | Floats per op |
+|---|---|---|---|
+| **NEON** | ARM (Apple Silicon) | 128 bit | 4 |
+| SSE | x86 | 128 bit | 4 |
+| AVX2 | x86 | 256 bit | 8 |
+| AVX-512 | x86 | 512 bit | 16 |
+
+Here's our vector add:
+
+```c
+#include <arm_neon.h>
+
+void vector_add_neon(float* a, float* b, float* c, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        // Load 4 floats from a and b into 128-bit registers
+        float32x4_t va = vld1q_f32(&a[i]);
+        float32x4_t vb = vld1q_f32(&b[i]);
+
+        // Add all 4 pairs in a single instruction
+        float32x4_t vc = vaddq_f32(va, vb);
+
+        // Store 4 results
+        vst1q_f32(&c[i], vc);
+    }
+    // Handle remaining elements
+    for (; i < n; i++) {
+        c[i] = a[i] + b[i];
+    }
+}
+```
+
+One `vaddq_f32` instruction does the work of 4 scalar additions. The CPU issues *one instruction* and the ALU performs the operation across all 4 lanes of the 128-bit register in parallel.
+
+<SIMDLanes />
+
+### 3.2 SIMD and memory
+
+SIMD makes the memory bandwidth question even more critical. A scalar loop might process 1 float per cycle. At 4 bytes per float and a 3.5 GHz clock (Apple M2 performance core), that's ~14 GB/s of data consumed per input array. A NEON loop processes 4 floats per cycle: <mark>~56 GB/s</mark> per input array. An operation like vector add that reads two arrays and writes one demands roughly <mark>~168 GB/s</mark> of total memory traffic. But Apple Silicon's unified memory delivers ~100 GB/s<sup>[1]</sup>.
+
+This means that for simple operations like vector add, <mark>the CPU becomes memory-bound once SIMD is enabled</mark>. The compute units can process data faster than memory can deliver it, so they spend cycles waiting. On x86 systems with DDR5 (~50 GB/s) and wider SIMD (AVX2 at 8 floats/op, AVX-512 at 16), the imbalance is even larger.
+
+Modern compilers can often **auto-vectorize** simple loops, so now even the scalar implementation may end up having the same performance level as the optimized version.
+
+### 3.3 The limits of CPU parallelism
+
+Let's count the total parallelism available on an Apple M2 CPU:
+
+- **4 performance cores** x **4 floats per NEON instruction** x **2 FMA units per core** = **32 float operations per cycle**
+
+At 3.5 GHz, that's ~0.1 TFLOPS peak (we are only talking about the CPU here. The Apple M2 also have a GPU, and the total peak is around 3.6 TFLOPS when counting the CPU/GPU association). A GPU like the RTX 4090 delivers <mark>~83 TFLOPS</mark> (FP32)<sup>[2]</sup>, roughly **800x more** raw compute. Even a high-end x86 CPU with AVX-512 (16 cores x 16 floats x 2 FMA x 4 GHz ≈ 2 TFLOPS) is still ~40x behind. The GPU wins by having *thousands* of simpler cores instead of a few powerful ones.
+
+The CPU's strength is *flexibility*: it can complete very fast a multitude of different tasks. The GPU's strength is *raw data parallelism*: when you have the same operation applied to millions of elements, nothing beats it.
+
+This is the bridge to the GPU world. SIMD is the CPU's way of doing data-parallel work. The GPU takes this concept and pushes it to the extreme.
+
+---
+
+## Part 4: The GPU + VRAM Side
+
+### 4.1 The GPU execution model
+
+A GPU doesn't run code the way a CPU does. Instead of a few powerful threads, it runs <mark>thousands of lightweight threads</mark> organized in a strict hierarchy:
+
+- **Thread**: The smallest unit. Each thread runs the same program (the *kernel*) but on different data.
+- **Warp** (NVIDIA) / **Wavefront** (AMD): 32 threads that execute **in lockstep**, running the same instruction at the same time. This is **SIMT** (Single Instruction, Multiple Threads), the GPU's version of SIMD.
+- **Block** (a.k.a. *thread block*): A group of warps (up to 1024 threads) that share fast on-chip memory and can synchronize with each other.
+- **Grid**: The entire collection of blocks that execute a kernel.
+
+Here's the same vector add as a CUDA kernel:
+
+```cpp
+// vector_add.cu - GPU version
+__global__ void vector_add(float* a, float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        c[i] = a[i] + b[i];
+    }
+}
+
+// Launch with 256 threads per block
+int threads = 256;
+int blocks = (n + threads - 1) / threads;
+vector_add<<<blocks, threads>>>(d_a, d_b, d_c, n);
+```
+
+There is no loop in that code. Each thread computes *one element*. If you have 10 million elements, you launch 10 million threads. The GPU hardware schedules them across its streaming multiprocessors (SMs).
+
+<GPUHierarchy />
+
+### 4.2 VRAM and the wide bus
+
+When those thousands of threads request data, VRAM must deliver. And it does, through a fundamentally different bus architecture than RAM.
+
+An NVIDIA RTX 4090 has a <mark>384-bit</mark> memory bus to its GDDR6X VRAM<sup>[2]</sup>. That means each memory transaction can move 48 bytes in a single cycle. At 21 Gbps per pin<sup>[5]</sup>, this yields <mark>~1 TB/s</mark> of bandwidth, roughly <mark>10x more than Apple Silicon's LPDDR5</mark> (and ~20x more than typical x86 DDR5).
+
+HBM (High Bandwidth Memory), used in data center GPUs like the A100 and H100, goes even further: a <mark>5120-bit</mark> bus delivering <mark>~3.35 TB/s</mark> on the H100<sup>[3][4]</sup>.
+
+This massive bandwidth exists because the GPU needs it. A warp of 32 threads, each reading a 4-byte float, needs 128 bytes per memory access. With thousands of warps active, the demand is enormous. The wide bus is what makes it work.
+
+But bandwidth alone isn't enough. *How* those threads access memory determines whether you use that bandwidth efficiently.
+
+### 4.3 Coalesced vs uncoalesced access
+
+This is <mark>a very important GPU optimization concept</mark>.
+
+When 32 threads in a warp access memory, the GPU memory controller tries to **coalesce** their requests into the minimum number of transactions. If adjacent threads access adjacent addresses, a single 128-byte transaction serves the entire warp:
+
+```cpp
+// Coalesced: thread 0 reads a[0], thread 1 reads a[1], ...
+int i = blockIdx.x * blockDim.x + threadIdx.x;
+float val = a[i];  // ✅ 1 transaction for 32 threads
+```
+
+```cpp
+// Uncoalesced: thread 0 reads a[0], thread 1 reads a[32], ...
+int i = (blockIdx.x * blockDim.x + threadIdx.x) * 32;
+float val = a[i];  // ❌ 32 separate transactions!
+```
+
+In the coalesced case, the 32 threads read `a[0]` through `a[31]`, a contiguous 128-byte block. One transaction.
+
+In the uncoalesced case, the 32 threads read `a[0]`, `a[32]`, `a[64]`, scattered across memory. Each read hits a different 128-byte segment, so the hardware must issue up to <mark>32 separate transactions</mark>, serializing them. The warp waits 32x longer.
+
+<CoalescedAccess />
+
+Sounds familiar? This is the GPU equivalent of the CPU's sequential-vs-strided access problem, but the penalty is even more severe because there's no hardware prefetcher to save you. The rule is simple: <mark>adjacent threads must access adjacent memory addresses.</mark>
+
+### 4.4 Latency hiding
+
+Here's the key insight that makes GPUs work despite VRAM having *higher* latency than RAM (~400 ns vs ~100 ns for RAM):
+
+When warp 0 issues a memory request and has to wait 400 ns for the data to arrive, the GPU doesn't stall. It switches to warp 1, which has data ready to compute. When warp 1 stalls, it switches to warp 2. And so on.
+
+If you have enough warps in flight (enough **occupancy**), there's always a warp ready to execute, and the memory latency is completely hidden. The cores never go idle.
+
+```
+Time ──────────────────────────────────────────────►
+
+Warp 0: [compute] [    waiting for memory...    ] [compute]
+Warp 1:           [compute] [  waiting for memory...  ] [compute]
+Warp 2:                     [compute] [ waiting for memory... ] [compute]
+Warp 3:                               [compute] [   wait...   ] [compute]
+         ▲                  ▲                    ▲
+         GPU always has     No idle              100% utilization
+         a warp to run      cycles               despite high latency
+```
+
+This is fundamentally different from the CPU approach:
+
+```
+Time ──────────────────────────────────────────────►
+
+Core 0: [compute] [  STALL - waiting for RAM  ] [compute] [  STALL  ]
+                   ▲
+                   Core is idle. Nothing to do.
+                   That's why CPUs need caches.
+```
+
+<mark>The CPU uses big caches to reduce the frequency of stalls. The GPU uses massive parallelism to tolerate stalls.</mark> Two different solutions to the same problem.
+
+<LatencyHiding />
+
+---
+
+## Part 5: Shared Memory and Tiling
+
+### 5.1 The GPU memory hierarchy
+
+Just like the CPU has L1/L2/L3 caches, the GPU has its own memory hierarchy:
+
+| Memory | Scope | Size | Latency | Managed by |
+|---|---|---|---|---|
+| **Registers** | Per thread | ~256 KB per SM | ~1 cycle | Compiler |
+| **Shared memory** | Per block | 48–100 KB per SM | ~5 cycles | <mark>Programmer</mark> |
+| **L2 cache** | Global | 4–50 MB | ~200 cycles | Hardware |
+| **VRAM (global)** | Global | 8–80 GB | ~400 cycles | Programmer |
+
+The critical difference from CPUs is that <mark>shared memory is explicitly managed by the programmer</mark>. It's like having a programmable L1 cache, you decide what to load into it, when to load it, and how threads access it. This is very powerful and unlocks enormous optimizations, but you have to do the work yourself.
+
+<GPUMemHierarchy />
+
+### 5.2 Matrix multiply: naive vs tiled
+
+Matrix multiplication is the canonical example of why shared memory matters. For $C = A \times B$ where all matrices are $N \times N$:
+
+$$C_{ij} = \sum_{k=0}^{N-1} A_{ik} \cdot B_{kj}$$
+
+Each element of $C$ requires reading an entire row of $A$ and an entire column of $B$: $2N$ reads from global memory. For $N^2$ elements, that's $2N^3$ total reads. But $A$ and $B$ only have $N^2$ elements each, meaning every element is read $N$ times on average.
+
+**The naive kernel**, where every thread reads what it needs from VRAM:
+
+```cpp
+__global__ void matmul_naive(float* A, float* B, float* C, int N) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < N && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < N; k++) {
+            sum += A[row * N + k] * B[k * N + col];
+            //     ^^^^^^^^^^^^^^^^   ^^^^^^^^^^^^^
+            //     Each read from global memory (~400 cycles)
+        }
+        C[row * N + col] = sum;
+    }
+}
+```
+
+For a 4096x4096 matrix, each thread reads 8192 floats from VRAM. With $4096^2 = 16.7M$ threads, that's <mark>~137 billion</mark> global memory reads.
+
+**The tiled kernel**, where threads cooperatively load tiles into shared memory:
+
+```cpp
+#define TILE 16
+
+__global__ void matmul_tiled(float* A, float* B, float* C, int N) {
+    __shared__ float As[TILE][TILE];  // shared memory tile for A
+    __shared__ float Bs[TILE][TILE];  // shared memory tile for B
+
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+    float sum = 0.0f;
+
+    // Slide a TILExTILE window across A's row and B's column
+    for (int t = 0; t < N / TILE; t++) {
+        // Each thread loads ONE element of each tile from global memory
+        As[threadIdx.y][threadIdx.x] = A[row * N + t * TILE + threadIdx.x];
+        Bs[threadIdx.y][threadIdx.x] = B[(t * TILE + threadIdx.y) * N + col];
+
+        __syncthreads();  // Wait for all threads to finish loading
+
+        // Now multiply using fast shared memory
+        for (int k = 0; k < TILE; k++) {
+            sum += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+            //     ^^^^^^^^^^^^^^^^^^   ^^^^^^^^^^^^^^^^^^
+            //     From shared memory (~5 cycles, not ~400)
+        }
+
+        __syncthreads();  // Wait before loading next tile
+    }
+
+    C[row * N + col] = sum;
+}
+```
+
+The key insight: each TILExTILE block of threads cooperatively loads two small tiles (16x16 = 256 elements each) into shared memory. Then *every thread* in the block reads from that fast local copy instead of going to VRAM. Each element of A and B is loaded from VRAM once per tile, but read from shared memory by 16 threads.
+
+Global memory reads drop from $2N^3$ to $2N^3 / \text{TILE}$, a <mark>16x reduction</mark> for TILE=16.
+
+<TiledMatmul />
+
+---
+
+## Part 6: The Full Journey
+
+### 6.1 End-to-end CUDA program
+
+Let's put it all together. Here's the complete flow, from CPU memory allocation to GPU computation and back:
+
+```cpp
+#include <stdio.h>
+#include <cuda_runtime.h>
+
+__global__ void vector_add(float* a, float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = a[i] + b[i];
+}
+
+int main() {
+    int n = 1 << 20;  // ~1 million elements
+    size_t size = n * sizeof(float);
+
+    // 1. Allocate in RAM (host memory)
+    float *h_a = (float*)malloc(size);
+    float *h_b = (float*)malloc(size);
+    float *h_c = (float*)malloc(size);
+
+    // Initialize on CPU
+    for (int i = 0; i < n; i++) {
+        h_a[i] = 1.0f;
+        h_b[i] = 2.0f;
+    }
+
+    // 2. Allocate in VRAM (device memory)
+    float *d_a, *d_b, *d_c;
+    cudaMalloc(&d_a, size);
+    cudaMalloc(&d_b, size);
+    cudaMalloc(&d_c, size);
+
+    // 3. Copy RAM → VRAM (over PCIe bus)
+    cudaMemcpy(d_a, h_a, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, h_b, size, cudaMemcpyHostToDevice);
+
+    // 4. Launch kernel (GPU reads/writes VRAM)
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    vector_add<<<blocks, threads>>>(d_a, d_b, d_c, n);
+
+    // 5. Copy VRAM → RAM (over PCIe bus)
+    cudaMemcpy(h_c, d_c, size, cudaMemcpyDeviceToHost);
+
+    // 6. Verify on CPU
+    printf("c[0] = %f (expected 3.0)\n", h_c[0]);
+
+    // Cleanup
+    cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
+    free(h_a); free(h_b); free(h_c);
+    return 0;
+}
+```
+
+Each numbered step maps to a distinct phase of the data journey:
+
+<FullJourney />
+
+### 6.2 The same thing in PyTorch
+
+All of the above (`malloc`, `cudaMalloc`, `cudaMemcpy`, kernel launch) is what frameworks do under the hood. Here's the mapping:
+
+<CodeCompare
+  leftTitle="CUDA C"
+  leftCode={`int n = 1 << 20;
+size_t size = n * sizeof(float);
+
+// Allocate on CPU
+float *h_a = (float*)malloc(size);
+float *h_b = (float*)malloc(size);
+float *h_c = (float*)malloc(size);
+
+// Allocate on GPU
+float *d_a, *d_b, *d_c;
+cudaMalloc(&d_a, size);
+cudaMalloc(&d_b, size);
+cudaMalloc(&d_c, size);
+
+// Copy CPU → GPU
+cudaMemcpy(d_a, h_a, size,
+  cudaMemcpyHostToDevice);
+cudaMemcpy(d_b, h_b, size,
+  cudaMemcpyHostToDevice);
+
+// Run kernel
+int threads = 256;
+int blocks = (n + threads - 1) / threads;
+vector_add<<<blocks, threads>>>
+  (d_a, d_b, d_c, n);
+
+// Copy GPU → CPU
+cudaMemcpy(h_c, d_c, size,
+  cudaMemcpyDeviceToHost);`}
+  rightTitle="PyTorch"
+  rightCode={`n = 1 << 20
+
+# Allocate on CPU
+a = torch.randn(n)
+b = torch.randn(n)
+
+# Allocate + copy to GPU
+# (cudaMalloc + cudaMemcpy)
+a_gpu = a.to("cuda")
+b_gpu = b.to("cuda")
+
+# Run operation
+# (kernel launch hidden)
+c_gpu = a_gpu + b_gpu
+
+# Copy GPU → CPU
+# (cudaMemcpy back)
+c = c_gpu.cpu()`}
+  lang="python"
+/>
+
+The framework handles memory allocation, transfers, and kernel selection. But the same principles apply: data lives in RAM or VRAM, transfers go over PCIe, and your GPU code's performance depends on coalesced access, occupancy, and shared memory usage, whether you write CUDA or call `torch.matmul`.
+
+### 6.3 The bandwidth reality
+
+Here's the full picture, the real bandwidth at every level of the system:
+
+| Path | Bandwidth | What it means |
+|---|---|---|
+| L1 cache ↔ CPU core | ~2 TB/s | ~64 bytes/cycle x 4 GHz |
+| L2 cache ↔ L1 | ~800 GB/s | Per-core |
+| L3 cache ↔ L2 | ~400 GB/s | Shared |
+| **RAM ↔ L3** | **~100 GB/s** | Apple M2, LPDDR5 <sup>[1]</sup> |
+| **PCIe 4.0 x16** | **~32 GB/s** | The CPU↔GPU bridge <sup>[3]</sup> |
+| PCIe 5.0 x16 | ~64 GB/s | Newer systems <sup>[3]</sup> |
+| **VRAM ↔ GPU (GDDR6X)** | **~1 TB/s** | RTX 4090 <sup>[2]</sup> |
+| **VRAM ↔ GPU (HBM3)** | **~3.35 TB/s** | H100 <sup>[4]</sup> |
+| Shared memory ↔ SM | ~19 TB/s | Per-SM, 128 bytes/cycle |
+
+Two things stand out:
+
+1. <mark>VRAM bandwidth is ~10x RAM bandwidth</mark> (or ~20x on x86 systems with DDR5): GPU can *feed* their cores faster.
+
+2. <mark>PCIe is the bottleneck.</mark> At 32 GB/s, transferring data between RAM and VRAM is 30x slower than reading from VRAM. This is why GPU programs try to minimize transfers and keep data on the GPU as long as possible. It's why PyTorch's `.to("cuda")` should be called once, not in a loop.
+
+---
+
+## Part 7: Why Local LLM Inference Is 10–20x Faster on GPU
+
+Now we have all the pieces to answer the question from the introduction.
+
+When an LLM generates text, there are two phases. During **prefill**, the model processes the entire input prompt at once. This is a matrix-matrix multiply, which is compute-bound and where GPUs' raw TFLOPS advantage shines. During **decode**, the model produces one token at a time: the current hidden state (a vector) is multiplied by the weight matrices of every layer (a matrix-vector multiply).
+
+For a 7B parameter model in FP16 (2 bytes per weight), decode means reading <mark>~14 GB of weights from memory for every single token</mark>. Each weight is used exactly once per token: read, multiply, move on.
+
+This makes the decode phase (the one that determines how fast text *appears*) <mark>memory-bandwidth-bound</mark>, not compute-bound. The arithmetic intensity is roughly 1 FLOP per byte loaded, far below the threshold where compute speed matters. Token generation speed is almost entirely determined by <mark>how fast you can stream weights from memory</mark>.
+
+### The bandwidth gap explains the speed gap
+
+| | CPU (Apple M2, LPDDR5) | GPU (RTX 4090, GDDR6X) |
+|---|---|---|
+| Memory bandwidth | ~100 GB/s | ~1,000 GB/s |
+| Time to stream 14 GB | ~140 ms | ~14 ms |
+| Tokens per second | ~7 | ~70 |
+| | | <mark>~10x faster</mark> |
+
+The ~10x speed ratio matches the ~10x bandwidth ratio almost exactly. On an x86 system with DDR5 (~50 GB/s), the gap widens to ~20x. Either way, the principle is the same: the GPU's memory bus can <mark>deliver weights to the compute units far faster</mark>, and that's what matters for this workload.
+
+Every mechanism we've covered plays a role in this:
+
+- The GPU's <mark>384-bit bus</mark> streams weights ~10x faster than Apple Silicon's 128-bit LPDDR5 bus (~20x faster than a typical x86 DDR5 setup)
+- Weight matrices are stored contiguously in VRAM, so warp reads are <mark>perfectly coalesced</mark> (one transaction serves 32 threads)
+- While one warp waits for the next chunk of weights, another is already multiplying, so <mark>latency is hidden</mark> despite VRAM's ~400 ns access time
+- The actual GEMM kernels (cuBLAS, used by PyTorch and llama.cpp) use <mark>tiled algorithms with shared memory</mark>, reducing redundant VRAM reads
+- The model must be loaded into VRAM *before* inference starts. Streaming over <mark>PCIe (~32 GB/s)</mark> during generation would be 30x slower than reading from VRAM
+
+<LLMInference />
+
+### What about quantization?
+
+Quantization (INT8, INT4) reduces the model size: a 7B model goes from 14 GB (FP16) to ~3.5 GB (INT4). This directly speeds up inference because there's less data to stream:
+
+| Precision | Model size (7B) | GPU tok/s | CPU tok/s |
+|---|---|---|---|
+| FP16 | 14 GB | ~70 | ~7 |
+| INT8 | 7 GB | ~140 | ~14 |
+| INT4 | 3.5 GB | ~280 | ~28 |
+
+> _**Note:** These numbers are idealized upper bounds assuming pure bandwidth-limited streaming. In practice, dequantization overhead (unpacking INT4 → FP16 for computation), attention over a growing KV cache, and other fixed costs eat into the gains. Real-world INT4 speedups over FP16 are closer to ~2–3x than a clean 4x. The GPU/CPU ratio also isn't perfectly constant: at very low precision, compute and dequantization can start to matter more than raw bandwidth. The GPU advantage stays at roughly ~10x regardless of quantization, because the bandwidth ratio doesn't change. But quantization lets smaller GPUs (or even CPUs) reach usable speeds by reducing the data that needs to stream through the bus._
+
+This is why `llama.cpp` defaults to Q4 quantization: it makes CPU inference on Apple Silicon quite usable (~28 tok/s for 7B) and GPU inference very fast (~280 tok/s).
+
+---
+## Conclusion
+
+LLM token generation is memory-bandwidth-bound. The GPU's ~10x wider memory bus translates almost directly into ~10x faster inference, and every mechanism we covered (coalesced access, latency hiding, tiling) has been developed to keep that wide bus saturated.
+
+That said, the gap is shrinking from the other direction. Quantization and distillation are making models small enough that CPU inference on Apple Silicon is becoming genuinely usable for everyday tasks. Whether that trend can close the gap enough for compute-heavy workloads like coding assistance remains an open question, but now you know exactly what the gap is made of.
+
+---
+
+## References
+
+1. [Apple unveils M2 - Apple Newsroom](https://www.apple.com/newsroom/2022/06/apple-unveils-m2-with-breakthrough-performance-and-capabilities/) — "100GB/s of unified memory bandwidth"
+2. [NVIDIA GeForce RTX 4090 - NVIDIA](https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4090/) — 16,384 CUDA cores, 384-bit memory bus, 83 TFLOPS FP32, GDDR6X
+3. [NVIDIA Hopper Architecture In-Depth - NVIDIA Developer Blog](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/) — H100 SXM5: 5 HBM3 stacks, 10 x 512-bit memory controllers (5120-bit), over 3 TB/s bandwidth; PCIe Gen 5: 128 GB/s total (64 GB/s each direction)
+4. [NVIDIA H100 - NVIDIA Data Center](https://www.nvidia.com/en-us/data-center/h100/) — 3.35 TB/s GPU memory bandwidth (SXM5)
+5. [GDDR6X - Micron](https://www.micron.com/products/memory/graphics-memory/gddr6x) — 19–24 Gb/s per pin

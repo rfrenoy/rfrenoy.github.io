@@ -1,0 +1,163 @@
+---
+/**
+ * Full data journey animation: RAM → PCIe → VRAM → GPU → VRAM → PCIe → RAM
+ * Steps annotated with the code that triggers each phase.
+ */
+---
+
+<figure class="full-journey">
+  <svg viewBox="0 0 700 180" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Full data journey from RAM through PCIe to VRAM and back">
+    <!-- Step markers -->
+    <circle cx="70" cy="25" r="12" class="step-circle" />
+    <text x="70" y="29" class="step-num">1</text>
+    <text x="70" y="50" class="step-label">malloc</text>
+    <text x="70" y="60" class="step-detail">Allocate in RAM</text>
+
+    <circle cx="190" cy="25" r="12" class="step-circle" />
+    <text x="190" y="29" class="step-num">2</text>
+    <text x="190" y="50" class="step-label">cudaMalloc</text>
+    <text x="190" y="60" class="step-detail">Allocate in VRAM</text>
+
+    <circle cx="320" cy="25" r="12" class="step-circle" />
+    <text x="320" y="29" class="step-num">3</text>
+    <text x="320" y="50" class="step-label">cudaMemcpy H→D</text>
+    <text x="320" y="60" class="step-detail">RAM → VRAM via PCIe</text>
+
+    <circle cx="460" cy="25" r="12" class="step-circle" />
+    <text x="460" y="29" class="step-num">4</text>
+    <text x="460" y="50" class="step-label">kernel<<<>>></text>
+    <text x="460" y="60" class="step-detail">GPU reads/writes VRAM</text>
+
+    <circle cx="580" cy="25" r="12" class="step-circle" />
+    <text x="580" y="29" class="step-num">5</text>
+    <text x="580" y="50" class="step-label">cudaMemcpy D→H</text>
+    <text x="580" y="60" class="step-detail">VRAM → RAM via PCIe</text>
+
+    <!-- Data flow pipeline -->
+    <!-- RAM block -->
+    <rect x="20" y="80" width="100" height="40" rx="6" class="zone ram-zone" />
+    <text x="70" y="104" class="zone-label">RAM</text>
+
+    <!-- Arrow RAM → PCIe -->
+    <line x1="120" y1="100" x2="170" y2="100" class="flow-line" />
+    <polygon points="167,95 177,100 167,105" class="flow-arrow fwd" />
+
+    <!-- PCIe -->
+    <rect x="178" y="85" width="80" height="30" rx="5" class="zone pcie-zone" />
+    <text x="218" y="104" class="zone-label pcie-text">PCIe</text>
+
+    <!-- Arrow PCIe → VRAM -->
+    <line x1="258" y1="100" x2="310" y2="100" class="flow-line" />
+    <polygon points="307,95 317,100 307,105" class="flow-arrow fwd" />
+
+    <!-- VRAM block -->
+    <rect x="318" y="80" width="100" height="40" rx="6" class="zone vram-zone" />
+    <text x="368" y="104" class="zone-label">VRAM</text>
+
+    <!-- Arrow VRAM ↔ GPU -->
+    <line x1="418" y1="100" x2="470" y2="100" class="flow-line wide-bus" />
+    <polygon points="467,93 480,100 467,107" class="flow-arrow gpu-arrow" />
+
+    <!-- GPU block -->
+    <rect x="482" y="80" width="100" height="40" rx="6" class="zone gpu-zone" />
+    <text x="532" y="104" class="zone-label">GPU cores</text>
+
+    <!-- Return path -->
+    <path d="M 368 120 L 368 150 L 70 150 L 70 120" class="return-path" fill="none" />
+    <polygon points="65,123 70,113 75,123" class="flow-arrow ret" />
+    <text x="218" y="163" class="return-label">Results back: VRAM → PCIe → RAM</text>
+
+    <!-- Bandwidth annotations -->
+    <text x="218" y="78" class="bw-label warn">~32 GB/s (bottleneck!)</text>
+    <text x="450" y="78" class="bw-label fast">~1 TB/s</text>
+  </svg>
+  <figcaption>The complete lifecycle: allocate, transfer to GPU, compute, transfer back. The PCIe bridge is the bottleneck — minimize crossings.</figcaption>
+</figure>
+
+<style>
+  .full-journey {
+    margin: 1.5rem 0;
+  }
+  .full-journey svg {
+    width: 100%;
+    max-width: 700px;
+    display: block;
+    margin: 0 auto;
+  }
+  .full-journey figcaption {
+    text-align: center;
+    font-size: 0.82rem;
+    color: #888;
+    margin-top: 0.5rem;
+  }
+  .step-circle {
+    fill: #f0f0f0;
+    stroke: #aaa;
+    stroke-width: 1.5;
+  }
+  .step-num {
+    font-size: 12px;
+    text-anchor: middle;
+    fill: #333;
+  }
+  .step-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    font-weight: 600;
+    text-anchor: middle;
+    fill: #444;
+  }
+  .step-detail {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 6.5px;
+    text-anchor: middle;
+    fill: #999;
+  }
+  .zone {
+    stroke-width: 1.5;
+  }
+  .ram-zone { fill: #dbe7fa; stroke: #7da4d9; }
+  .pcie-zone { fill: #fff3e0; stroke: #e6a23c; }
+  .vram-zone { fill: #d9f0c8; stroke: #6ea84a; }
+  .gpu-zone { fill: #f0ffe8; stroke: #8cc063; }
+  .zone-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px;
+    font-weight: 700;
+    text-anchor: middle;
+    fill: #333;
+  }
+  .pcie-text { fill: #b37400; }
+  .flow-line {
+    stroke: #888;
+    stroke-width: 2;
+  }
+  .flow-line.wide-bus {
+    stroke: #4caf50;
+    stroke-width: 4;
+  }
+  .flow-arrow { fill: #888; }
+  .flow-arrow.fwd { fill: #4a9eff; }
+  .flow-arrow.gpu-arrow { fill: #4caf50; }
+  .flow-arrow.ret { fill: #7da4d9; }
+  .return-path {
+    stroke: #7da4d9;
+    stroke-width: 1.5;
+    stroke-dasharray: 6 3;
+  }
+  .return-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    text-anchor: middle;
+    fill: #7da4d9;
+    font-weight: 600;
+  }
+  .bw-label {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 8px;
+    text-anchor: middle;
+    font-weight: 600;
+  }
+  .bw-label.warn { fill: #e6a23c; }
+  .bw-label.fast { fill: #2e7d32; }
+</style>
