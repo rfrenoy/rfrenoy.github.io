@@ -9,7 +9,7 @@ series: "Daily Feed"
 
 **Source**: Simon Willison's Weblog | **Tags**: `aria`, `html`, `screen-readers` | **Published**: 2026-05-23 | **Novelty**: 40%
 
-The article discusses the <dl> element's flexibility, noting that a <dt> can be followed by multiple <dd>s and can be grouped in a <div> for styling. It also mentions that 'description lists' are now more accurately called 'definition lists' since an HTML5 draft in 2008, and highlights the use of ARIA labels for accessibility support. An example is provided showing how to structure these elements with a <h2>, <dl>, and <div>.
+The article discusses the &lt;dl&gt; element's flexibility, noting that a &lt;dt&gt; can be followed by multiple &lt;dd&gt;s and can be grouped in a &lt;div&gt; for styling. It also mentions that 'description lists' are now more accurately called 'definition lists' since an HTML5 draft in 2008, and highlights the use of ARIA labels for accessibility support. An example is provided showing how to structure these elements with a &lt;h2&gt;, &lt;dl&gt;, and &lt;div&gt;.
 
 ---
 
