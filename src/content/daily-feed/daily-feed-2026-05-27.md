@@ -197,15 +197,9 @@ Vibe coding is a technique where developers prompt large language models (LLMs) 
 
 ---
 
-## [
-Distributing LLM inference in DwarfStar
-](
-http://antirez.com/news/167
-)
+## [Distributing LLM inference in DwarfStar](http://antirez.com/news/167)
 
-**Source**: 
-<antirez>
- | **Tags**: `ai`, `distributed`, `inference`, `llm`, `macbook` | **Published**: 2026-05-25 | **Novelty**: 17%
+**Source**: antirez | **Tags**: `ai`, `distributed`, `inference`, `llm`, `macbook` | **Published**: 2026-05-25 | **Novelty**: 17%
 
 The article discusses distributing Large Language Model (LLM) inference on multiple MacBooks M5 Max or M3 Ultra systems to overcome the limitations of high VRAM costs and memory bandwidth. It explores a novel approach where models can be run in a completely shared-nothing way, combining their logits for better performance. This method is suggested as an alternative to traditional memory duplication or parallel execution techniques, using open weights models like Minimax M2.7, DeepSeek v4 Flash, and Mimo V2.5.
 
